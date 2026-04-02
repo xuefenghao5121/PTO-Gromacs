@@ -36,7 +36,7 @@ OBJECTS = $(SOURCES:.c=.o)
 HEADERS = gromacs_pto_arm.h
 
 # 测试目标
-TESTS = tests/test_nonbonded tests/benchmark_nonbonded
+TESTS = tests/test_nonbonded tests/benchmark_nonbonded tests/failure_tests
 
 # 默认目标
 all: $(OBJECTS) tests
@@ -51,6 +51,10 @@ tests/test_nonbonded: tests/test_nonbonded.c $(OBJECTS)
 
 # 性能基准测试
 tests/benchmark_nonbonded: tests/benchmark_nonbonded.c $(OBJECTS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+# 失败测试用例（验证修复）
+tests/failure_tests: tests/failure_tests.c $(OBJECTS)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 tests: $(TESTS)

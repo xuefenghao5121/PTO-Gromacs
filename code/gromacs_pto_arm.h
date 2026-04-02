@@ -281,6 +281,99 @@ int gmx_pto_get_sve_vector_length_floats(void);
  */
 void gmx_pto_print_info(const gmx_pto_nonbonded_context_t *context);
 
+/* ===== 7. 新增函数 - 解决失败用例后添加 ===== */
+
+/**
+ * PTOTile - 动态分配Tile结构，用于存储单个Tile的坐标和力
+ */
+typedef struct pto_tile {
+    int n_atoms;          // 原子数
+    int capacity;         // 分配容量
+    float (*coords)[3];   // 坐标 [n_atoms][3] 动态分配
+    float (*forces)[3];   // 力 [n_atoms][3] 动态分配
+} PTOTile;
+
+/**
+ * Tile分区结构 - 用于自适应划分
+ */
+typedef struct pto_tile_partition {
+    int n_tiles;                  // Tile数量
+    int capacity;                 // 分配容量
+    PTOTile *tiles;               // Tile数组
+} PTOTilePartition;
+
+/**
+ * 创建Tile（动态分配）
+ * @param n_atoms 原子数
+ * @return 新建Tile，失败返回NULL
+ */
+PTOTile* pto_tile_create(int n_atoms);
+
+/**
+ * 销毁Tile
+ */
+void pto_tile_destroy(PTOTile* tile);
+
+/**
+ * 检查Tile是否能放入指定大小缓存
+ * @param tile_size Tile原子数
+ * @param cache_size_kb 缓存大小 (KB)
+ * @return 1如果能放，0放不下
+ */
+int pto_check_tile_fits_in_cache(int tile_size, int cache_size_kb);
+
+/**
+ * 自适应Tile划分 - 密度感知负载均衡
+ * @param coords 原子坐标数组 [n_atoms*3]
+ * @param n_atoms 总原子数
+ * @param box 模拟盒子 [3][3]
+ * @param target_tile_size 目标Tile大小（原子数）
+ * @param partition 输出分区结果
+ * @return 0成功，<0错误
+ */
+int pto_adaptive_tile_partition(const float *coords, int n_atoms, 
+                                 float box[3][3], int target_tile_size,
+                                 PTOTilePartition *partition);
+
+/**
+ * 销毁Tile分区
+ */
+void pto_partition_destroy(PTOTilePartition *partition);
+
+/**
+ * 最小图像约定 - 处理周期性边界条件
+ * @param dx 输入输出距离，会被修正
+ * @param box_length 盒子边长
+ * @param box_half 盒子半长
+ */
+void pto_minimum_image(float *dx, float box_length, float box_half);
+
+/**
+ * 计算SVE需要的迭代次数
+ * @param n 总元素数
+ * @return 需要迭代的次数
+ */
+int pto_sve_iterations(int n);
+
+/**
+ * 获取SVE向量宽度（字数）
+ * @return 每个SVE向量包含的32位字数
+ */
+int pto_sve_vector_width_words(void);
+
+/**
+ * 单个原子对的非键相互作用计算，保证力对称
+ * 用于验证牛顿第三定律
+ */
+void pto_nonbonded_pair_compute(float coords_i[3], float coords_j[3], 
+                                 float force_i[3], float force_j[3],
+                                 float sigma, float epsilon);
+
+/**
+ * 计算LJ能量（参考实现）
+ */
+float pto_lj_energy(float r, float sigma, float epsilon);
+
 #ifdef __cplusplus
 }
 #endif

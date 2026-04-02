@@ -1,17 +1,42 @@
 # Git ignore for PTO-Gromacs
 # Exclude large upstream source directories that are just for research reference
 research/pto-mechanism/repos/
+
+# Compiled objects and libraries
 *.o
 *.a
 *.so
-tests/test_nonbonded
-tests/benchmark_nonbonded
+
+# Compiled test binaries
+code/tests/test_nonbonded
+code/tests/benchmark_nonbonded
+code/tests/failure_tests
+code/tests/*.o
+
+# Benchmark raw output (keep scripts and reports, exclude raw data)
+benchmarks/results/*.txt
+benchmarks/results/*.png
+benchmarks/results/*.csv
 *.log
 *.out
+
 # Editor files
 *.swp
 *~
 .DS_Store
+.vscode/
+.idea/
+*.pyc
+__pycache__/
+
 # Build outputs
-build/
+code/build/
+*.tmp
+
+# Large binary files
+*.pth
+*.pt
+*.ckpt
+*.dat
+
 # Git ignore end

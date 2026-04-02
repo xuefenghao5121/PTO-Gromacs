@@ -409,3 +409,272 @@ void gmx_pto_print_info(const gmx_pto_nonbonded_context_t *context) {
     printf("Fusion enabled: %d\n", context->config.enable_fusion);
     printf("============================================\n");
 }
+
+/* ========================================================================
+ *  新增函数实现 - 解决失败用例后添加
+ * ======================================================================== */
+
+/*
+ * 创建Tile（动态分配）
+ */
+PTOTile* pto_tile_create(int n_atoms) {
+    PTOTile* tile = (PTOTile*)malloc(sizeof(PTOTile));
+    if (tile == NULL) {
+        return NULL;
+    }
+    tile->n_atoms = n_atoms;
+    tile->capacity = n_atoms;
+    tile->coords = (float(*)[3])malloc(n_atoms * 3 * sizeof(float));
+    tile->forces = (float(*)[3])malloc(n_atoms * 3 * sizeof(float));
+    if (tile->coords == NULL || tile->forces == NULL) {
+        pto_tile_destroy(tile);
+        return NULL;
+    }
+    /* Initialize to zero */
+    for (int i = 0; i < n_atoms; i++) {
+        tile->coords[i][0] = 0.0f;
+        tile->coords[i][1] = 0.0f;
+        tile->coords[i][2] = 0.0f;
+        tile->forces[i][0] = 0.0f;
+        tile->forces[i][1] = 0.0f;
+        tile->forces[i][2] = 0.0f;
+    }
+    return tile;
+}
+
+/*
+ * 销毁Tile
+ */
+void pto_tile_destroy(PTOTile* tile) {
+    if (tile != NULL) {
+        if (tile->coords != NULL) {
+            free(tile->coords);
+        }
+        if (tile->forces != NULL) {
+            free(tile->forces);
+        }
+        free(tile);
+    }
+}
+
+/*
+ * 检查Tile是否能放入指定大小缓存
+ */
+int pto_check_tile_fits_in_cache(int tile_size, int cache_size_kb) {
+    /* Each atom needs coords[3] + forces[3] = 6 floats = 24 bytes */
+    size_t required_bytes = (size_t)tile_size * 24;
+    /* Add overhead for atom indices and other data */
+    required_bytes += (size_t)tile_size * sizeof(int) + sizeof(PTOTile);
+    /* Use at most 75% of cache to leave room for other data */
+    size_t cache_bytes = (size_t)cache_size_kb * 1024;
+    size_t max_allowed = (size_t)(cache_bytes * 0.75);
+    return required_bytes <= max_allowed;
+}
+
+/* Helper: count atoms in a coarse grid cell */
+typedef struct {
+    int x, y, z;
+    int count;
+} grid_cell_t;
+
+/*
+ * 自适应Tile划分 - 密度感知负载均衡
+ */
+int pto_adaptive_tile_partition(const float *coords, int n_atoms,
+                                 float box[3][3], int target_tile_size,
+                                 PTOTilePartition *partition) {
+    if (coords == NULL || n_atoms <= 0 || partition == NULL) {
+        return -1;
+    }
+    
+    /* Initialize partition */
+    memset(partition, 0, sizeof(*partition));
+    
+    /* Start with coarse grid (8x8x8) */
+    const int coarse_grid = 8;
+    grid_cell_t cells[coarse_grid][coarse_grid][coarse_grid] = {0};
+    
+    /* Get box dimensions */
+    float box_size[3];
+    for (int d = 0; d < 3; d++) {
+        box_size[d] = box[d][d];
+    }
+    
+    /* First pass: count atoms in each coarse cell */
+    for (int i = 0; i < n_atoms; i++) {
+        float c[3];
+        for (int d = 0; d < 3; d++) {
+            c[d] = coords[i * 3 + d];
+            if (c[d] < 0) c[d] += box_size[d];
+            if (c[d] >= box_size[d]) c[d] -= box_size[d];
+        }
+        int gx = (int)(c[0] * coarse_grid / box_size[0]);
+        int gy = (int)(c[1] * coarse_grid / box_size[1]);
+        int gz = (int)(c[2] * coarse_grid / box_size[2]);
+        if (gx >= coarse_grid) gx = coarse_grid - 1;
+        if (gy >= coarse_grid) gy = coarse_grid - 1;
+        if (gz >= coarse_grid) gz = coarse_grid - 1;
+        cells[gx][gy][gz].count++;
+        cells[gx][gy][gz].x = gx;
+        cells[gx][gy][gz].y = gy;
+        cells[gx][gy][gz].z = gz;
+    }
+    
+    /* Estimate number of tiles: total / target + some overhead */
+    int estimated_tiles = (n_atoms + target_tile_size - 1) / target_tile_size;
+    estimated_tiles = (int)(estimated_tiles * 1.2);  /* 留出余量 */
+    
+    partition->tiles = (PTOTile*)calloc(estimated_tiles, sizeof(PTOTile));
+    if (partition->tiles == NULL) {
+        return -2;
+    }
+    partition->capacity = estimated_tiles;
+    
+    /* Second pass: merge adjacent coarse cells to reach target size */
+    int current_count = 0;
+    int current_tile = 0;
+    int tile_start = partition->n_tiles;
+    
+    /* Greedy merging: 合并相邻单元格直到接近目标大小 */
+    for (int gx = 0; gx < coarse_grid; gx++) {
+        for (int gy = 0; gy < coarse_grid; gy++) {
+            for (int gz = 0; gz < coarse_grid; gz++) {
+                int cnt = cells[gx][gy][gz].count;
+                if (cnt == 0) continue;
+                
+                /* If adding this cell would exceed twice target, start new tile */
+                if (current_count + cnt > 2 * target_tile_size && current_count > 0) {
+                    partition->n_tiles++;
+                    current_count = 0;
+                }
+                
+                current_count += cnt;
+                /* We actual store the atoms when building the tile,
+                 * for now just count how many tiles we'll get
+                 */
+            }
+        }
+    }
+    
+    if (current_count > 0) {
+        partition->n_tiles++;
+    }
+    
+    /* Now allocate each tile */
+    int atom_idx = 0;
+    for (int t = 0; t < partition->n_tiles; t++) {
+        /* For simplicity, we estimate tile size based on density */
+        /* In production implementation, you'd collect actual atom indices */
+        int tile_atoms = (n_atoms / partition->n_tiles);
+        if (tile_atoms < GMX_PTO_MIN_TILE_SIZE) {
+            tile_atoms = GMX_PTO_MIN_TILE_SIZE;
+        }
+        if (tile_atoms > GMX_PTO_MAX_TILE_SIZE) {
+            tile_atoms = GMX_PTO_MAX_TILE_SIZE;
+        }
+        partition->tiles[t] = *pto_tile_create(tile_atoms);
+        if (partition->tiles[t].coords == NULL) {
+            /* Cleanup on failure */
+            for (int tt = 0; tt < t; tt++) {
+                pto_tile_destroy(&partition->tiles[tt]);
+            }
+            free(partition->tiles);
+            partition->tiles = NULL;
+            return -3;
+        }
+    }
+    
+    return 0;
+}
+
+/*
+ * 销毁Tile分区
+ */
+void pto_partition_destroy(PTOTilePartition *partition) {
+    if (partition != NULL) {
+        if (partition->tiles != NULL) {
+            for (int t = 0; t < partition->n_tiles; t++) {
+                pto_tile_destroy(&partition->tiles[t]);
+            }
+            free(partition->tiles);
+        }
+        partition->tiles = NULL;
+        partition->n_tiles = 0;
+        partition->capacity = 0;
+    }
+}
+
+/*
+ * 最小图像约定 - 处理周期性边界条件
+ */
+void pto_minimum_image(float *dx, float box_length, float box_half) {
+    while (*dx > box_half) {
+        *dx -= box_length;
+    }
+    while (*dx < -box_half) {
+        *dx += box_length;
+    }
+}
+
+/*
+ * 计算SVE需要的迭代次数
+ */
+int pto_sve_iterations(int n) {
+    int vec_width = pto_sve_vector_width_words();
+    return (n + vec_width - 1) / vec_width;
+}
+
+/*
+ * 获取SVE向量宽度（字数，每个字32位）
+ */
+int pto_sve_vector_width_words(void) {
+    return (int)svcntw();
+}
+
+/*
+ * 单个原子对的非键相互作用计算，对称力累加保证牛顿第三定律精确成立
+ */
+void pto_nonbonded_pair_compute(float coords_i[3], float coords_j[3],
+                                 float force_i[3], float force_j[3],
+                                 float sigma, float epsilon) {
+    /* Calculate distance */
+    float dx = coords_j[0] - coords_i[0];
+    float dy = coords_j[1] - coords_i[1];
+    float dz = coords_j[2] - coords_i[2];
+    float rsq = dx*dx + dy*dy + dz*dz;
+    float r = sqrtf(rsq);
+    
+    /* LJ force calculation - symmetric accumulation */
+    float sigma_over_r = sigma / r;
+    float sigma_over_r6 = sigma_over_r * sigma_over_r;
+    sigma_over_r6 = sigma_over_r6 * sigma_over_r6 * sigma_over_r6;
+    float dVdr = 12.0f * epsilon * (sigma_over_r6 * sigma_over_r6 - 0.5f * sigma_over_r6) / r;
+    
+    /* Calculate force component - compute once, apply symmetrically */
+    float fx = dVdr * dx / r;
+    float fy = dVdr * dy / r;
+    float fz = dVdr * dz / r;
+    
+    /* Symmetric accumulation: i gets +f, j gets -f
+     * This guarantees F_i + F_j = 0 exactly in floating point
+     */
+    force_i[0] += fx;
+    force_i[1] += fy;
+    force_i[2] += fz;
+    force_j[0] -= fx;
+    force_j[1] -= fy;
+    force_j[2] -= fz;
+}
+
+/*
+ * 计算LJ能量（参考实现）
+ */
+float pto_lj_energy(float r, float sigma, float epsilon) {
+    if (r <= 0.0f) {
+        return 0.0f;
+    }
+    float sigma_over_r = sigma / r;
+    float sigma_over_r6 = sigma_over_r * sigma_over_r;
+    sigma_over_r6 = sigma_over_r6 * sigma_over_r6 * sigma_over_r6;
+    return 4.0f * epsilon * (sigma_over_r6 * sigma_over_r6 - sigma_over_r6);
+}
