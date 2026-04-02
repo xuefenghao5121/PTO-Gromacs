@@ -1,0 +1,17 @@
+# Git ignore for PTO-Gromacs
+# Exclude large upstream source directories that are just for research reference
+research/pto-mechanism/repos/
+*.o
+*.a
+*.so
+tests/test_nonbonded
+tests/benchmark_nonbonded
+*.log
+*.out
+# Editor files
+*.swp
+*~
+.DS_Store
+# Build outputs
+build/
+# Git ignore end
