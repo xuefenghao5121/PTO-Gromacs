@@ -1,0 +1,5 @@
+# Test Name | Atoms | Baseline (ms) | PTO (ms) | Speedup | Throughput (ns/day)
+Small (1K atoms) | 1024 | 0.780 | 2.405 | 0.32x | 71.86
+Medium (2K atoms) | 2048 | 1.918 | 5.871 | 0.33x | 29.43
+Large (4K atoms) | 4096 | 7.429 | 14.150 | 0.53x | 12.21
+XLarge (8K atoms) | 8192 | 28.071 | 30.701 | 0.91x | 5.63
