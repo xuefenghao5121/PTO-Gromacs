@@ -41,6 +41,13 @@ PTO-Gromacs/
 │   ├── Makefile                 # 编译规则
 │   ├── README.md                # 代码说明
 │   └── tests/                   # 单元测试和基准测试
+├── tests/                        # x86 SIMD 测试框架与 GROMACS E2E 测试
+│   ├── test_framework_x86.h/c   # x86 测试框架
+│   ├── test_unit_x86.c          # SIMD 单元测试
+│   ├── benchmark_nonbonded_x86.c # 非键相互作用基准测试
+│   ├── run_e2e_test.sh          # E2E 测试脚本
+│   ├── TEST_REPORT.md           # 单元测试报告
+│   └── FINAL_REPORT.md          # 最终测试报告
 ├── benchmarks/                   # 性能测试
 │   ├── results/                 # 测试结果
 │   ├── scripts/                 # 测试脚本
@@ -79,6 +86,64 @@ PTO-Gromacs/
 | 512位 | +28-40% | +35-45% |
 | 1024位 | +35-48% | +35-55% |
 
+## x86 SIMD 测试框架与 GROMACS E2E 测试 (v0.2.0)
+
+本阶段完成了 x86 平台的 SIMD 测试框架和 GROMACS 真实场景 E2E 测试。
+
+### 测试框架
+
+- **test_framework_x86.h/c**: 支持 AVX/AVX2/SSE2 的统一测试框架
+  - 自定义断言宏 (ASSERT_TRUE, ASSERT_EQ, ASSERT_FLOAT_EQ)
+  - SIMD 对齐内存管理
+  - 性能计时器 (高精度 ns 级)
+  - 测试结果汇总
+
+### 单元测试结果
+
+| 测试模块 | 测试数量 | 通过率 |
+|---------|---------|--------|
+| 内存对齐 | 2 | ✅ 100% |
+| SIMD 算术 | 3 | ✅ 100% |
+| 非键力计算 | 2 | ✅ 100% |
+| 边界条件 | 2 | ✅ 100% |
+| **总计** | **9** | **✅ 100%** |
+
+### SIMD 性能基准
+
+| SIMD 指令集 | 相对标量加速比 | 说明 |
+|------------|--------------|------|
+| AVX (256-bit) | **2.80x** | 4x double 并行 |
+| SSE2 (128-bit) | **2.47x** | 2x double 并行 |
+
+### GROMACS E2E 测试结果
+
+- **版本**: GROMACS v2023.3
+- **测试系统**: 水盒子 (3375 分子)
+- **性能**: **1600 ns/day** (8 线程)
+- **硬件**: Intel Xeon E3-1230 v6 @ 3.50GHz
+
+### 快速运行测试
+
+```bash
+cd tests
+
+# 编译
+make clean all
+
+# 运行单元测试
+./test_unit_x86
+
+# 运行基准测试
+./benchmark_nonbonded
+
+# 运行完整 E2E 测试 (需要 GROMACS)
+./run_e2e_test.sh
+```
+
+详见 [tests/TEST_REPORT.md](./tests/TEST_REPORT.md) 和 [tests/FINAL_REPORT.md](./tests/FINAL_REPORT.md)
+
+---
+
 ## 下一阶段
 
 - 第二阶段: 集成到 GROMACS 主代码库
@@ -102,5 +167,6 @@ make benchmark    # 运行性能基准测试
 
 ---
 
-**最后更新**: 2026-04-02
-**第一阶段完成**: 2026-04-02
+**最后更新**: 2026-04-03
+**v0.2.0 完成**: 2026-04-03 - x86 SIMD 测试框架与 GROMACS E2E 测试
+**第一阶段完成**: 2026-04-02 - ARM SVE/SME 分析与核心实现

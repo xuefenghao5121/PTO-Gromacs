@@ -1,0 +1,28 @@
+#include "oplsaa.ff/forcefield.itp"
+
+[ moleculetype ]
+; Name  nrexcl
+DPPC     1
+
+[ atoms ]
+;   nr  type  resnr residue  atom   cgnr    charge       mass  typeB    chargeB      massB
+     1  opls_129   1    DPPC    N      1    -0.600     14.01
+     2  opls_130   1    DPPC   C11     1     0.100     12.01
+     3  opls_135   1    DPPC   C12     1     0.100     12.01
+     4  opls_136   1    DPPC   C13     1     0.100     12.01
+     5  opls_137   1    DPPC   C14     1     0.000     12.01
+
+[ bonds ]
+;  ai    aj funct         c0         c1         c2         c3
+    1     2     1
+    1     3     1
+    1     4     1
+    1     5     1
+
+[ system ]
+; Name
+DPPC Test System
+
+[ molecules ]
+; Compound        #mols
+DPPC              100
