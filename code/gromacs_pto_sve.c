@@ -95,7 +95,7 @@ void gmx_pto_sve_coulomb_force(svfloat32_t rsq, svfloat32_t qq, svfloat32_t kapp
     /* 力: f/r */
     svfloat32_t f_over_r = svmul_f32_x(p, qq, svmul_f32_x(p, inv_rsq,
                        svdiv_f32_x(p, svsub_f32_x(p, svdup_f32(1.0f), kr2), one_kR)));
-    *f_over_r = f_over_r;
+    /* f_over_r already set */
     *f_force_out = f_over_r;
 }
 
@@ -142,7 +142,7 @@ void gmx_pto_sve_compute_pair(gmx_pto_nonbonded_context_t *context,
         
         /* 遍历j原子，按SVE向量宽度分块处理 */
         for (int lj = 0; lj < nj; lj += vl) {
-            int remain = nj - lj;
+            /* remain unused */
             svbool_t p = svwhilelt_b32(lj, nj);
             
             /* 加载j原子坐标到SVE向量 */
@@ -161,9 +161,9 @@ void gmx_pto_sve_compute_pair(gmx_pto_nonbonded_context_t *context,
                 /* 简化版本: 逐个处理，核心是展示SVE向量化 */
                 
                 /* 计算力分量 */
-                svfloat32_t dx = svsub_f32_m(in_cutoff, svdup_f32(0.0f), x1, x2);
-                svfloat32_t dy = svsub_f32_m(in_cutoff, svdup_f32(0.0f), y1, y2);
-                svfloat32_t dz = svsub_f32_m(in_cutoff, svdup_f32(0.0f), z1, z2);
+                svfloat32_t dx = svsub_f32_z(in_cutoff, x1, x2);
+                svfloat32_t dy = svsub_f32_z(in_cutoff, y1, y2);
+                svfloat32_t dz = svsub_f32_z(in_cutoff, z1, z2);
                 
                 /* 获取LJ参数 - 简化版本，实际需要按类型查找 */
                 /* 在完整GROMACS集成中，这会从预计算的类型对表获取 */
@@ -187,19 +187,19 @@ void gmx_pto_sve_compute_pair(gmx_pto_nonbonded_context_t *context,
                 /* 计算静电力 */
                 svfloat32_t f_coul_over_r = svdup_f32(0.0f);
                 svfloat32_t energy_coul = svdup_f32(0.0f);
-                if (svnot_z(svptest(p, qq))) {
-                    gmx_pto_sve_coulomb_force(rsq, qq, context->params.rf_kappa,
+                if (svptest_any(p, svcmpne_n_f32(p, qq, 0.0f))) {
+                    gmx_pto_sve_coulomb_force(rsq, qq, svdup_f32(context->params.rf_kappa),
                                              &f_coul_over_r, &energy_coul);
                 }
                 
                 /* 总力除以r */
-                svfloat32_t f_over_r = svadd_f32_m(in_cutoff, svdup_f32(0.0f),
+                svfloat32_t f_over_r = svadd_f32_z(in_cutoff,
                                                    f_lj_over_r, f_coul_over_r);
                 
                 /* 力分量 = f_over_r * 坐标差 */
-                svfloat32_t fx_i = svmul_f32_m(in_cutoff, svdup_f32(0.0f), f_over_r, dx);
-                svfloat32_t fy_i = svmul_f32_m(in_cutoff, svdup_f32(0.0f), f_over_r, dy);
-                svfloat32_t fz_i = svmul_f32_m(in_cutoff, svdup_f32(0.0f), f_over_r, dz);
+                svfloat32_t fx_i = svmul_f32_z(in_cutoff, f_over_r, dx);
+                svfloat32_t fy_i = svmul_f32_z(in_cutoff, f_over_r, dy);
+                svfloat32_t fz_i = svmul_f32_z(in_cutoff, f_over_r, dz);
                 
                 /* 累加到i原子 */
                 fx_acc = svadd_f32_x(all_p, fx_acc, fx_i);

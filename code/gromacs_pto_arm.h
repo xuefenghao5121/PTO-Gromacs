@@ -115,7 +115,7 @@ typedef struct {
     gmx_pto_nonbonded_params_t params;
     
     /* SVE/SME状态 */
-    svbool_t sve_predicate;     /* SVE谓词掩码 */
+    char sve_predicate_reserved[64]; /* SVE谓词掩码 */     /* SVE谓词掩码 */
     bool sme_enabled;           /* SME是否已启用 */
 } gmx_pto_nonbonded_context_t;
 

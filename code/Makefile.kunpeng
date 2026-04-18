@@ -59,17 +59,17 @@ KUNPENG_CFLAGS += -DTILE_SIZE_MAX=1024
 
 # NUMA 链接
 KUNPENG_LDFLAGS = -lm
-KUNPENG_LDFLAGS += -lnuma
+KUNPENG_LDFLAGS += 
 KUNPENG_LDFLAGS += -fopenmp
 
 # 默认使用鲲鹏930优化
 CFLAGS ?= $(KUNPENG_CFLAGS)
 LDFLAGS ?= $(KUNPENG_LDFLAGS)
 
-# 源文件（使用优化后的Kunpeng版本）
+# 源文件
 SOURCES = \
     gromacs_pto_tiling.c \
-    gromacs_pto_sve_kunpeng.c \
+    gromacs_pto_sve.c \
     gromacs_pto_sme.c
 
 HEADERS = gromacs_pto_arm.h

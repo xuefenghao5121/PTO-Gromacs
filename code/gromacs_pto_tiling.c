@@ -492,7 +492,15 @@ int pto_adaptive_tile_partition(const float *coords, int n_atoms,
     
     /* Start with coarse grid (8x8x8) */
     const int coarse_grid = 8;
-    grid_cell_t cells[coarse_grid][coarse_grid][coarse_grid] = {0};
+grid_cell_t cells[coarse_grid][coarse_grid][coarse_grid];
+    // Initialize VLA (cannot use {0})
+    for (int i = 0; i < coarse_grid; i++) {
+        for (int j = 0; j < coarse_grid; j++) {
+            for (int k = 0; k < coarse_grid; k++) {
+                memset(&cells[i][j][k], 0, sizeof(grid_cell_t));
+            }
+        }
+    }
     
     /* Get box dimensions */
     float box_size[3];
