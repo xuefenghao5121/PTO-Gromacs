@@ -27,6 +27,13 @@
 #define HAS_SVE 0
 #endif
 
+#ifdef __AVX__
+#include <immintrin.h>
+#define HAS_AVX 1
+#else
+#define HAS_AVX 0
+#endif
+
 /* ============ GRO parser ============ */
 typedef struct { int natoms; float *x; float box[3]; } GroData;
 static GroData* read_gro(const char *fn) {
@@ -432,6 +439,201 @@ static double ptov3_compute_scalar(PTOv3Ctx *ctx, float *f_aos, int n, float box
     return (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
 }
 
+/* ====================================================================
+ * PTO v3 compute kernel - x86 AVX 向量化路径
+ * 
+ * 修复问题E: 添加完整的 AVX 向量化路径
+ * 参考 ARM SVE 版本的融合模式:
+ * - 累加器保持在 YMM 寄存器
+ * - 向量级别计算距离平方和力
+ * - SoA + tile 分组实现连续加载
+ * ==================================================================== */
+#if HAS_AVX && !HAS_SVE
+static double ptov3_compute_avx(PTOv3Ctx *ctx, float *f_aos, int n, float box[3],
+                                NBList *nl, float cut) {
+    float csq = cut*cut, eps = 0.5f, ssq = 0.09f;
+    int num_tiles = ctx->num_tiles;
+    float *sx = ctx->sx, *sy = ctx->sy, *sz = ctx->sz;
+    
+    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    memset(f_aos, 0, n*3*sizeof(float));
+    
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        float *lfx = ctx->thread_lfx[tid];
+        float *lfy = ctx->thread_lfy[tid];
+        float *lfz = ctx->thread_lfz[tid];
+        memset(lfx, 0, n*sizeof(float));
+        memset(lfy, 0, n*sizeof(float));
+        memset(lfz, 0, n*sizeof(float));
+        
+        /* AVX 常量 */
+        __m256 vone = _mm256_set1_ps(1.0f);
+        __m256 vzero = _mm256_setzero_ps();
+        
+        #pragma omp for schedule(dynamic,64)
+        for (int i = 0; i < n; i++) {
+            float xi = sx[i], yi = sy[i], zi = sz[i];
+            
+            /* ★ 向量累加器 - 参考 SVE 的 fx_a/fy_a/fz_a */
+            __m256 vfx_a = _mm256_setzero_ps();
+            __m256 vfy_a = _mm256_setzero_ps();
+            __m256 vfz_a = _mm256_setzero_ps();
+            
+            for (int ti = 0; ti < num_tiles; ti++) {
+                int run_start = ctx->tile_run_start[i][ti];
+                int run_count = ctx->tile_run_count[i][ti];
+                if (run_count == 0) continue;
+                
+                int base = nl->start[i] + run_start;
+                
+                /* ★ 检查整个 run 是否连续（同 SVE 版本优化） */
+                int is_contig = 1;
+                if (run_count >= 2) {
+                    for (int m = 1; m < run_count; m++) {
+                        int j_prev = ctx->sorted_jatoms[base + m - 1];
+                        int j_curr = ctx->sorted_jatoms[base + m];
+                        if (j_curr != j_prev + 1) { is_contig = 0; break; }
+                    }
+                }
+                
+                for (int k = 0; k < run_count; k += 8) {
+                    int rem = run_count - k;
+                    int cnt = (rem < 8) ? rem : 8;
+                    
+                    __m256 vxj, vyj, vzj;
+                    int jj_buf[8];
+                    
+                    if (is_contig && cnt == 8) {
+                        /* ★ 连续加载路径: 直接从 SoA 数组加载，无需 gather 到栈 */
+                        int j0 = ctx->sorted_jatoms[base + k];
+                        vxj = _mm256_loadu_ps(&sx[j0]);
+                        vyj = _mm256_loadu_ps(&sy[j0]);
+                        vzj = _mm256_loadu_ps(&sz[j0]);
+                        for (int m = 0; m < 8; m++) jj_buf[m] = j0 + m;
+                    } else {
+                        /* Fallback: gather 到 SoA 缓冲区 */
+                        float xj_buf[8] __attribute__((aligned(32)));
+                        float yj_buf[8] __attribute__((aligned(32)));
+                        float zj_buf[8] __attribute__((aligned(32)));
+                        
+                        for (int m = 0; m < cnt; m++) {
+                            int j = ctx->sorted_jatoms[base + k + m];
+                            jj_buf[m] = j;
+                            xj_buf[m] = sx[j];
+                            yj_buf[m] = sy[j];
+                            zj_buf[m] = sz[j];
+                        }
+                        for (int m = cnt; m < 8; m++) {
+                            jj_buf[m] = i;
+                            xj_buf[m] = xi;
+                            yj_buf[m] = yi;
+                            zj_buf[m] = zi;
+                        }
+                        vxj = _mm256_load_ps(xj_buf);
+                        vyj = _mm256_load_ps(yj_buf);
+                        vzj = _mm256_load_ps(zj_buf);
+                    }
+                    
+                    /* 距离向量 */
+                    __m256 dx = _mm256_sub_ps(_mm256_set1_ps(xi), vxj);
+                    __m256 dy = _mm256_sub_ps(_mm256_set1_ps(yi), vyj);
+                    __m256 dz = _mm256_sub_ps(_mm256_set1_ps(zi), vzj);
+                    
+                    /* PBC (简化: box > 0) */
+                    __m256 vbox_x = _mm256_set1_ps(box[0]);
+                    __m256 vbox_y = _mm256_set1_ps(box[1]);
+                    __m256 vbox_z = _mm256_set1_ps(box[2]);
+                    
+                    dx = _mm256_sub_ps(dx, _mm256_mul_ps(vbox_x,
+                         _mm256_round_ps(_mm256_div_ps(dx, vbox_x), _MM_FROUND_TO_NEAREST_INT)));
+                    dy = _mm256_sub_ps(dy, _mm256_mul_ps(vbox_y,
+                         _mm256_round_ps(_mm256_div_ps(dy, vbox_y), _MM_FROUND_TO_NEAREST_INT)));
+                    dz = _mm256_sub_ps(dz, _mm256_mul_ps(vbox_z,
+                         _mm256_round_ps(_mm256_div_ps(dz, vbox_z), _MM_FROUND_TO_NEAREST_INT)));
+                    
+                    /* rsq */
+                    __m256 rsq = _mm256_add_ps(_mm256_add_ps(
+                                    _mm256_mul_ps(dx, dx), _mm256_mul_ps(dy, dy)),
+                                    _mm256_mul_ps(dz, dz));
+                    
+                    /* mask: rsq < csq && rsq > 1e-8 */
+                    __m256 mask_c = _mm256_cmp_ps(rsq, _mm256_set1_ps(csq), _CMP_LT_OS);
+                    __m256 mask_n = _mm256_cmp_ps(rsq, _mm256_set1_ps(1e-8f), _CMP_GT_OS);
+                    __m256 mask = _mm256_and_ps(mask_c, mask_n);
+                    
+                    if (_mm256_movemask_ps(mask) == 0) continue;
+                    
+                    /* LJ 力计算 (向量化) */
+                    __m256 vrsq_safe = _mm256_max_ps(rsq, _mm256_set1_ps(1e-12f));
+                    __m256 vinv_rsq = _mm256_div_ps(vone, vrsq_safe);
+                    __m256 vs2 = _mm256_mul_ps(_mm256_set1_ps(ssq), vinv_rsq);
+                    __m256 vs4 = _mm256_mul_ps(vs2, vs2);
+                    __m256 vs6 = _mm256_mul_ps(vs4, vs2);
+                    __m256 vs12 = _mm256_mul_ps(vs6, vs6);
+                    
+#ifdef __AVX2__
+                    /* FMA: fr = 24*eps * (2*s12 - s6) * inv_rsq */
+                    __m256 vterm = _mm256_fmsub_ps(_mm256_set1_ps(2.0f), vs12, vs6);
+#else
+                    __m256 vterm = _mm256_sub_ps(_mm256_mul_ps(_mm256_set1_ps(2.0f), vs12), vs6);
+#endif
+                    __m256 vfr = _mm256_mul_ps(_mm256_set1_ps(24.0f * eps),
+                                 _mm256_mul_ps(vterm, vinv_rsq));
+                    
+                    /* 应用 mask */
+                    vfr = _mm256_and_ps(vfr, mask);
+                    
+                    __m256 vfx = _mm256_mul_ps(vfr, dx);
+                    __m256 vfy = _mm256_mul_ps(vfr, dy);
+                    __m256 vfz = _mm256_mul_ps(vfr, dz);
+                    
+                    /* ★ 累加到向量累加器 */
+                    vfx_a = _mm256_add_ps(vfx_a, vfx);
+                    vfy_a = _mm256_add_ps(vfy_a, vfy);
+                    vfz_a = _mm256_add_ps(vfz_a, vfz);
+                    
+                    /* scatter j 力 (牛顿第三定律) */
+                    float fxo[8], fyo[8], fzo[8];
+                    _mm256_storeu_ps(fxo, vfx);
+                    _mm256_storeu_ps(fyo, vfy);
+                    _mm256_storeu_ps(fzo, vfz);
+                    for (int m = 0; m < cnt; m++) {
+                        int j = jj_buf[m];
+                        lfx[j] -= fxo[m];
+                        lfy[j] -= fyo[m];
+                        lfz[j] -= fzo[m];
+                    }
+                }
+            }
+            
+            /* ★ 水平求和累加器，写回 i 原子力 */
+            __m256 hfx = _mm256_hadd_ps(vfx_a, vfy_a);
+            __m256 hfz = _mm256_hadd_ps(vfz_a, vzero);
+            hfx = _mm256_hadd_ps(hfx, hfz);
+            __m128 lo = _mm256_castps256_ps128(hfx);
+            __m128 hi = _mm256_extractf128_ps(hfx, 1);
+            __m128 sum = _mm_add_ps(lo, hi);
+            
+            lfx[i] += _mm_cvtss_f32(sum);
+            lfy[i] += _mm_cvtss_f32(_mm_shuffle_ps(sum, sum, _MM_SHUFFLE(1,1,1,1)));
+            lfz[i] += _mm_cvtss_f32(_mm_shuffle_ps(sum, sum, _MM_SHUFFLE(2,2,2,2)));
+        }
+        
+        #pragma omp critical
+        for (int k = 0; k < n; k++) {
+            f_aos[k*3+0] += lfx[k];
+            f_aos[k*3+1] += lfy[k];
+            f_aos[k*3+2] += lfz[k];
+        }
+    }
+    
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
+}
+#endif /* HAS_AVX && !HAS_SVE */
+
 /* ============ Main ============ */
 int main(int argc, char *argv[]) {
     if(argc<2){ printf("Usage: %s <file.gro> [cutoff] [nsteps] [tile_size]\n",argv[0]); return 1; }
@@ -450,6 +652,8 @@ int main(int argc, char *argv[]) {
            n, g->box[0],g->box[1],g->box[2], cut, steps, tile_size);
 #if HAS_SVE
     printf("SVE: %d-bit (%d floats)\n", svcntb()*8, svcntw());
+#elif HAS_AVX
+    printf("Mode: x86 AVX/AVX2 (256-bit, 8 floats)\n");
 #else
     printf("Mode: x86 scalar\n");
 #endif
@@ -481,6 +685,11 @@ int main(int argc, char *argv[]) {
     ptov3_compute(ctx, f_v3, n, g->box, nl, cut);
     double tv3=0;
     for(int s=0;s<steps;s++) tv3+=ptov3_compute(ctx, f_v3, n, g->box, nl, cut);
+#elif HAS_AVX
+    printf("PTO v3 AVX:  "); fflush(stdout);
+    ptov3_compute_avx(ctx, f_v3, n, g->box, nl, cut);
+    double tv3=0;
+    for(int s=0;s<steps;s++) tv3+=ptov3_compute_avx(ctx, f_v3, n, g->box, nl, cut);
 #else
     printf("PTO v3 Tile: "); fflush(stdout);
     ptov3_compute_scalar(ctx, f_v3, n, g->box, nl, cut);
@@ -517,6 +726,8 @@ int main(int argc, char *argv[]) {
     printf("Scalar:    %.3f ms/step (1.00x)\n", ts/steps*1000);
 #if HAS_SVE
     printf("PTO v3:    %.3f ms/step (%.2fx)\n", tv3/steps*1000, ts/tv3);
+#elif HAS_AVX
+    printf("PTO v3:    %.3f ms/step (%.2fx) [x86 AVX/AVX2]\n", tv3/steps*1000, ts/tv3);
 #else
     printf("PTO v3:    %.3f ms/step (%.2fx) [x86 scalar fallback]\n", tv3/steps*1000, ts/tv3);
 #endif
