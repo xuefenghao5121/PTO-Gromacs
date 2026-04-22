@@ -1,165 +1,61 @@
 #
-# GROMACS PTO Makefile - 鲲鹏930 优化版本
+# GROMACS PTO Makefile - 鲲鹏930 SVE 版本
 #
-# 基于柱子哥的深度优化建议
+# 简化实现，只保留 SVE 路径
 #
 # 使用方法：
-#   make                    # 编译 ARM 优化版本
+#   make                    # 编译
+#   make e2e                # 编译端到端测试
 #   make clean              # 清理
-#   make test               # 运行测试
 #
 
-# 编译器设置
 CC ?= gcc
-CXX ?= g++
 
-# ===== 鲲鹏930 优化配置 =====
-# 根据柱子哥的建议，使用完整的优化选项
+# ===== 鲲鹏930 SVE 优化配置 =====
+CFLAGS  = -O3
+CFLAGS += -march=armv9-a+sve+sve2
+CFLAGS += -mcpu=tsv110
+CFLAGS += -msve-vector-bits=256
+CFLAGS += -ffast-math -funroll-loops -fipa-pta
+CFLAGS += -falign-functions=64 -falign-loops=16
+CFLAGS += -flto=auto
+CFLAGS += -fopenmp -fopenmp-simd
+CFLAGS += -Wall -Wextra -I.
+CFLAGS += -DARM64=1 -DHAVE_SVE=1 -DHAVE_SVE2=1 -DSVE_VECTOR_BITS=256
+CFLAGS += -DTILE_SIZE_DEFAULT=512 -DTILE_SIZE_MAX=1024
 
-# 基础优化选项
-KUNPENG_CFLAGS = -O3
+LDFLAGS = -lm -lnuma -fopenmp
 
-# 架构和向量扩展
-KUNPENG_CFLAGS += -march=armv9-a+sve+sve2
-KUNPENG_CFLAGS += -mcpu=tsv110  # 鲲鹏930 (TaiShan v110)
-KUNPENG_CFLAGS += -msve-vector-bits=256  # 固定SVE向量长度
-
-# 数学优化
-KUNPENG_CFLAGS += -ffast-math
-KUNPENG_CFLAGS += -funroll-loops
-KUNPENG_CFLAGS += -fipa-pta
-
-# 函数优化
-KUNPENG_CFLAGS += -falign-functions=64
-KUNPENG_CFLAGS += -falign-loops=16
-
-# LTO 链接时优化
-KUNPENG_CFLAGS += -flto=auto
-
-# 并行优化
-KUNPENG_CFLAGS += -fopenmp
-KUNPENG_CFLAGS += -fopenmp-simd
-
-# NUMA 支持
-KUNPENG_CFLAGS += -DNUMA_AWARE=1
-
-# 其他优化
-KUNPENG_CFLAGS += -Wall -Wextra
-KUNPENG_CFLAGS += -I.
-
-# 编译器宏定义
-KUNPENG_CFLAGS += -DARM64=1
-KUNPENG_CFLAGS += -DHAVE_SVE=1
-KUNPENG_CFLAGS += -DHAVE_SVE2=1
-KUNPENG_CFLAGS += -DSVE_VECTOR_BITS=256
-
-# 鲲鹏930 特定调优
-KUNPENG_CFLAGS += -DTILE_SIZE_DEFAULT=512
-KUNPENG_CFLAGS += -DTILE_SIZE_MAX=1024
-
-# NUMA 链接
-KUNPENG_LDFLAGS = -lm
-KUNPENG_LDFLAGS += -lnuma
-KUNPENG_LDFLAGS += -fopenmp
-
-# 默认使用鲲鹏930优化
-CFLAGS ?= $(KUNPENG_CFLAGS)
-LDFLAGS ?= $(KUNPENG_LDFLAGS)
-
-# 源文件（使用优化后的Kunpeng版本）
-SOURCES = \
-    gromacs_pto_tiling.c \
-    gromacs_pto_sve_kunpeng.c \
-    gromacs_pto_sme.c
-
+# SVE 核心源文件
+SOURCES = gromacs_pto_tiling.c gromacs_pto_sve.c
 HEADERS = gromacs_pto_arm.h
-
-# 测试文件
-TEST_DIR = tests
-TEST_SOURCES = tests/test_nonbonded.c
-
-# 对象文件
 OBJECTS = $(SOURCES:.c=.o)
-TEST_OBJECTS = $(TEST_SOURCES:.c=.o)
 
-# 测试目标
-TESTS = $(TEST_DIR)/test_nonbonded $(TEST_DIR)/benchmark_nonbonded
+# 端到端测试
+E2E_SOURCES = pto_e2e_v3.c
+E2E_BENCHMARK_SOURCES = pto_gromacs_e2e_benchmark.c
 
-# 默认目标
-all: $(OBJECTS) tests
+all: $(OBJECTS) e2e
 
-# 编译对象文件
 %.o: %.c $(HEADERS)
-	@echo "Compiling $< with Kunpeng 930 optimizations..."
 	$(CC) $(CFLAGS) -c $< -o $@
-	@echo "✓ Compiled: $@"
 
-# 测试: 非键相互作用
-$(TEST_DIR)/test_nonbonded: $(TEST_SOURCES) $(OBJECTS)
-	@echo "Linking test_nonbonded..."
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-	@echo "✓ Linked: $@"
+e2e: $(OBJECTS) $(E2E_SOURCES)
+	$(CC) $(CFLAGS) $(E2E_SOURCES) $(OBJECTS) -o pto_e2e_v3 $(LDFLAGS)
 
-# 性能基准测试
-$(TEST_DIR)/benchmark_nonbonded: tests/benchmark_nonbonded.c $(OBJECTS)
-	@echo "Linking benchmark_nonbonded..."
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-	@echo "✓ Linked: $@"
+benchmark: $(OBJECTS) $(E2E_BENCHMARK_SOURCES)
+	$(CC) $(CFLAGS) $(E2E_BENCHMARK_SOURCES) $(OBJECTS) -o pto_e2e_benchmark $(LDFLAGS)
 
-tests: $(TESTS)
-	@echo "All tests built successfully!"
-
-# 运行所有测试
-test: tests/test_nonbonded
-	@echo "Running tests..."
-	./tests/test_nonbonded
-
-# 运行性能基准测试
-benchmark: tests/benchmark_nonbonded
-	@echo "Running performance benchmark..."
-	./tests/benchmark_nonbonded
-
-# 清理
 clean:
-	@echo "Cleaning build artifacts..."
-	rm -f $(OBJECTS)
-	rm -f $(TESTS)
-	rm -f *.o
-	@echo "✓ Cleaned"
+	rm -f $(OBJECTS) pto_e2e_v3 pto_e2e_benchmark *.o
 
-# 显示编译信息
 info:
 	@echo "========================================"
-	@echo "GROMACS PTO for 鲲鹏930 (Kunpeng 930)"
+	@echo "GROMACS PTO - SVE Only (鲲鹏930)"
 	@echo "========================================"
-	@echo ""
-	@echo "Compiler: $(CC)"
-	@echo "Version:  $(shell $(CC) --version | head -1)"
-	@echo ""
-	@echo "CFLAGS:"
-	@echo "  $(CFLAGS)"
-	@echo ""
-	@echo "LDFLAGS:"
-	@echo "  $(LDFLAGS)"
-	@echo ""
 	@echo "Sources: $(SOURCES)"
 	@echo "Headers: $(HEADERS)"
-	@echo "Tests:   $(TESTS)"
-	@echo ""
-	@echo "========================================"
-	@echo "Optimization Features Enabled:"
-	@echo "========================================"
-	@echo "  ✓ SVE (Scalable Vector Extension)"
-	@echo "  ✓ SVE2 (Enhanced SVE)"
-	@echo "  ✓ SVE Vector Length: 256-bit"
-	@echo "  ✓ TaiShan v110 (Kunpeng 930)"
-	@echo "  ✓ FMA (Fused Multiply-Add)"
-	@echo "  ✓ Loop Unrolling"
-	@echo "  ✓ OpenMP Parallel"
-	@echo "  ✓ OpenMP SIMD"
-	@echo "  ✓ LTO (Link-Time Optimization)"
-	@echo "  ✓ NUMA Aware Memory Allocation"
-	@echo "  ✓ Fast Math (aggressive optimizations)"
+	@echo "CFLAGS:  $(CFLAGS)"
 	@echo "========================================"
 
-.PHONY: all clean test benchmark info tests
+.PHONY: all e2e benchmark clean info

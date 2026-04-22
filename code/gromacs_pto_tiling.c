@@ -1,5 +1,5 @@
 /*
- * GROMACS PTO for ARM SVE/SME
+ * GROMACS PTO for ARM SVE
  * 
  * Tile划分实现 - 第一阶段核心
  * 
@@ -28,9 +28,7 @@ void gmx_pto_config_init(gmx_pto_config_t *config) {
     config->tile_size_atoms = GMX_PTO_DEFAULT_TILE_SIZE;
     config->tile_size_cache_kb = GMX_PTO_DEFAULT_L2_CACHE_KB;
     config->enable_sve = true;
-    config->enable_sme = true;
     config->enable_fusion = true;
-    config->num_sme_tiles = 8;
     config->verbose = false;
 }
 
@@ -203,9 +201,7 @@ int gmx_pto_create_tiling(int total_atoms, const float *coords,
             }
         }
         
-        /* SME初始化 */
-        tile->in_sme_registers = false;
-        tile->sme_tile_start = 0;
+        /* 初始化 */
         tile->forces_computed = false;
     }
     
@@ -215,13 +211,6 @@ int gmx_pto_create_tiling(int total_atoms, const float *coords,
     
     context->num_neighbor_pairs = 0;
     context->neighbor_pairs = NULL;
-    context->sme_enabled = false;
-    
-    /* 检查SME可用性 */
-    if (config->enable_sme && gmx_pto_sme_is_available()) {
-        context->sme_enabled = true;
-        gmx_pto_sme_enable();
-    }
     
     if (config->verbose) {
         gmx_pto_print_info(context);
@@ -252,13 +241,8 @@ void gmx_pto_destroy_tiling(gmx_pto_nonbonded_context_t *context) {
         context->neighbor_pairs = NULL;
     }
     
-    if (context->sme_enabled) {
-        gmx_pto_sme_disable();
-    }
-    
     context->num_tiles = 0;
     context->num_neighbor_pairs = 0;
-    context->sme_enabled = false;
 }
 
 /*
@@ -389,7 +373,7 @@ int gmx_pto_get_sve_vector_length_floats(void) {
  * 打印信息
  */
 void gmx_pto_print_info(const gmx_pto_nonbonded_context_t *context) {
-    printf("=== GROMACS PTO ARM SVE/SME Information ===\n");
+    printf("=== GROMACS PTO ARM SVE Information ===\n");
     printf("Version: %d.%d.%d\n",
            GROMACS_PTO_ARM_VERSION_MAJOR,
            GROMACS_PTO_ARM_VERSION_MINOR,
@@ -404,8 +388,6 @@ void gmx_pto_print_info(const gmx_pto_nonbonded_context_t *context) {
                gmx_pto_get_sve_vector_length_bits(),
                gmx_pto_get_sve_vector_length_floats());
     }
-    printf("SME enabled: %d (available: %d)\n",
-           context->config.enable_sme, context->sme_enabled);
     printf("Fusion enabled: %d\n", context->config.enable_fusion);
     printf("============================================\n");
 }

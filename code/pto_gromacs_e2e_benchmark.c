@@ -6,7 +6,7 @@
  *
  * 编译:
  *   gcc -O3 -march=armv9-a+sve+sve2 -msve-vector-bits=256 -ffast-math -fopenmp \
- *       pto_gromacs_e2e_benchmark.c gromacs_pto_tiling.o gromacs_pto_sve.o gromacs_pto_sme.o \
+ *       pto_gromacs_e2e_benchmark.c gromacs_pto_tiling.o gromacs_pto_sve.o \
  *       -o pto_e2e_benchmark -lm -fopenmp
  *
  * 运行:

@@ -1,5 +1,5 @@
 /*
- * GROMACS PTO for ARM SVE/SME
+ * GROMACS PTO for ARM SVE
  * 
  * SVE向量化核心计算实现
  * 
@@ -249,9 +249,7 @@ void gmx_pto_nonbonded_compute_tile(gmx_pto_nonbonded_context_t *context,
     
     gmx_pto_tile_t *tile = &context->tiles[tile_idx];
     
-    /* 如果使用SME，Tile坐标已经加载到Tile寄存器 */
-    /* 在本基础版本中，我们直接从内存访问 */
-    /* SME优化版本会使用gmx_pto_sme_load_coords提前加载 */
+    /* 从内存访问Tile坐标（SVE向量化） */
     
     /* 找到所有包含此Tile的邻居对并计算 */
     for (int p = 0; p < context->num_neighbor_pairs; p++) {

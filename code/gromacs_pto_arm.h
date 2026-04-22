@@ -1,13 +1,12 @@
 /*
- * GROMACS PTO (Parallel Tile Operation) for ARM SVE/SME
+ * GROMACS PTO (Parallel Tile Operation) for ARM SVE
  * 
- * 方案一：非键相互作用优化 - 头文件
+ * 非键相互作用优化 - 头文件
  * 
  * 功能：
  * - Tile划分设计
  * - 全流程算子融合
- * - SVE向量化支持
- * - SME寄存器利用
+ * - SVE向量化
  */
 
 #ifndef GROMACS_PTO_ARM_H
@@ -16,7 +15,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <arm_sve.h>
-#include <arm_sme.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,9 +34,7 @@ typedef struct {
     int tile_size_atoms;        /* 每个Tile处理的原子数 默认: 64 */
     int tile_size_cache_kb;     /* Tile目标缓存大小 (KB) 默认: 512 (匹配L2) */
     bool enable_sve;            /* 启用SVE向量化 默认: true */
-    bool enable_sme;            /* 启用SME Tile寄存器 默认: true */
     bool enable_fusion;         /* 启用全流程融合 默认: true */
-    int num_sme_tiles;          /* 使用的SME Tile数量 默认: 8 */
     bool verbose;               /* 调试输出 */
 } gmx_pto_config_t;
 
@@ -46,7 +42,6 @@ typedef struct {
  * Tile描述符 - PTO核心数据结构
  * 
  * 每个Tile代表一个独立可并行的计算块
- * 在ARM SME中，Tile坐标数据可以直接存储在SME Tile寄存器中
  */
 typedef struct {
     int tile_id;                /* Tile唯一ID */
@@ -58,11 +53,7 @@ typedef struct {
     float min_coord[3];
     float max_coord[3];
     
-    /* 存储 - SME寄存器编号或者内存地址 */
-    bool in_sme_registers;      /* 是否存储在SME Tile寄存器中 */
-    int sme_tile_start;         /* SME起始Tile编号 */
-    
-    /* 结果缓存 */
+    /* 存储 */
     bool forces_computed;       /* 是否已计算力 */
 } gmx_pto_tile_t;
 
@@ -114,9 +105,8 @@ typedef struct {
     gmx_pto_neighbor_pair_t *neighbor_pairs;  /* 邻居Tile对 */
     gmx_pto_nonbonded_params_t params;
     
-    /* SVE/SME状态 */
-    char sve_predicate_reserved[64]; /* SVE谓词掩码 */     /* SVE谓词掩码 */
-    bool sme_enabled;           /* SME是否已启用 */
+    /* SVE状态 */
+    char sve_predicate_reserved[64]; /* SVE谓词掩码 */
 } gmx_pto_nonbonded_context_t;
 
 /*
@@ -189,44 +179,7 @@ void gmx_pto_sve_lj_force(svfloat32_t rsq, svfloat32_t eps_ij, svfloat32_t sigma
 void gmx_pto_sve_coulomb_force(svfloat32_t rsq, svfloat32_t qq, svfloat32_t kappa,
                                svfloat32_t *f_force_out, svfloat32_t *energy_out);
 
-/* ===== 4. SME Tile寄存器支持 ===== */
-
-/**
- * 启用SME (如果硬件支持)
- * 返回: true如果SME可用并已启用
- */
-bool gmx_pto_sme_enable(void);
-
-/**
- * 禁用SME
- */
-void gmx_pto_sme_disable(void);
-
-/**
- * 检查SME是否可用
- */
-bool gmx_pto_sme_is_available(void);
-
-/**
- * 加载Tile坐标到SME Tile寄存器
- * 
- * 参数:
- *   start_tile - SME起始Tile编号 (每个坐标维度占用一个Tile)
- *   coords - 坐标数组
- *   num_atoms - 原子数
- * 
- * 说明:
- *   对于N个原子，x/y/z分别存储在3个连续的SME Tile中
- *   每个Tile存储N个float，使用ST1指令
- */
-void gmx_pto_sme_load_coords(int start_tile, const float *coords, int num_atoms);
-
-/**
- * 从SME Tile寄存器读取力
- */
-void gmx_pto_sme_store_forces(int start_tile, float *forces, int num_atoms);
-
-/* ===== 5. 融合全流程计算 - 主入口 ===== */
+/* ===== 4. 融合全流程计算 - 主入口 ===== */
 
 /**
  * PTO融合非键相互作用计算 - 整个流程在单个函数内完成
@@ -264,7 +217,7 @@ void gmx_pto_sve_compute_pair(gmx_pto_nonbonded_context_t *context,
                               gmx_pto_tile_t *tile_i,
                               gmx_pto_tile_t *tile_j);
 
-/* ===== 6. 工具函数 ===== */
+/* ===== 5. 工具函数 ===== */
 
 /**
  * 获取当前SVE向量长度（bits）
@@ -281,7 +234,7 @@ int gmx_pto_get_sve_vector_length_floats(void);
  */
 void gmx_pto_print_info(const gmx_pto_nonbonded_context_t *context);
 
-/* ===== 7. 新增函数 - 解决失败用例后添加 ===== */
+/* ===== 6. 新增函数 - Tile 工具 ===== */
 
 /**
  * PTOTile - 动态分配Tile结构，用于存储单个Tile的坐标和力
