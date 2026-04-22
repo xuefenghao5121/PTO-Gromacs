@@ -170,12 +170,17 @@ void gmx_pto_sve_compute_pair(gmx_pto_nonbonded_context_t *context,
                 svfloat32_t eps_ij = svdup_f32(0.5f);
                 svfloat32_t sigma_ij = svdup_f32(0.3f);
                 
-                /* 获取电荷乘积 */
+                /* 获取电荷乘积 - 向量化: 每个 j 通道独立加载电荷 */
                 svfloat32_t qq;
                 if (context->params.charges != NULL) {
                     float qi = context->params.charges[gi];
-                    float qj = context->params.charges[idx_j[lj]];
-                    qq = svdup_f32(qi * qj);
+                    /* 逐个 gather j 原子电荷到临时缓冲，然后向量加载 */
+                    float qj_buf[16]; /* SVE VL 最多 16 个 float (512-bit) */
+                    int cnt = (nj - lj < vl) ? (nj - lj) : vl;
+                    for (int m = 0; m < cnt; m++)
+                        qj_buf[m] = context->params.charges[idx_j[lj + m]];
+                    svfloat32_t qj_v = svld1_f32(p, qj_buf);
+                    qq = svmul_f32_x(p, svdup_f32(qi), qj_v);
                 } else {
                     qq = svdup_f32(0.0f);
                 }
