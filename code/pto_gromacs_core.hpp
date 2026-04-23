@@ -303,14 +303,12 @@ inline __attribute__((always_inline)) void TNONBONDED_LJ(
     fiz += svadda_f32(valid, 0.0f, fz);
 
     /* Step 13: j 力写回 (向量化 read-modify-write) */
-    if (svptest_any(pg_all, valid)) {
-        svfloat32_t old_lfx = svld1_f32(pg, &lfx[j0]);
-        svfloat32_t old_lfy = svld1_f32(pg, &lfy[j0]);
-        svfloat32_t old_lfz = svld1_f32(pg, &lfz[j0]);
-        svst1_f32(pg, &lfx[j0], svsub_f32_x(pg, old_lfx, fx));
-        svst1_f32(pg, &lfy[j0], svsub_f32_x(pg, old_lfy, fy));
-        svst1_f32(pg, &lfz[j0], svsub_f32_x(pg, old_lfz, fz));
-    }
+    svfloat32_t old_lfx = svld1_f32(pg, &lfx[j0]);
+    svfloat32_t old_lfy = svld1_f32(pg, &lfy[j0]);
+    svfloat32_t old_lfz = svld1_f32(pg, &lfz[j0]);
+    svst1_f32(pg, &lfx[j0], svsub_f32_x(pg, old_lfx, fx));
+    svst1_f32(pg, &lfy[j0], svsub_f32_x(pg, old_lfy, fy));
+    svst1_f32(pg, &lfz[j0], svsub_f32_x(pg, old_lfz, fz));
 }
 
 /* --- TLJ_FORCE: LJ力融合算子 (SVE 全流水线) ---
