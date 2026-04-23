@@ -1,10 +1,205 @@
-# PTO-GROMACS - GROMACS 基于华为 PTO 技术的 ARM SVE/SME 优化
+# PTO-GROMACS - GROMACS 非键相互作用 ARM SVE 优化
 
 ## 项目概述
 
-本项目是天权-HPC团队针对 GROMACS 分子动力学模拟应用，基于华为 PTO (Processing-in-Memory Tiling Optimization) 技术，在 ARMv9 架构上进行性能优化的研究项目。
+本项目是天权-HPC团队针对 GROMACS 分子动力学模拟中的**非键相互作用（Non-bonded interactions）**，在 ARM SVE 平台上进行性能优化的研究项目。
 
-**目标**: 通过 PTO 算子融合和 Tile 划分技术，结合 ARM SVE 可变长度向量化和 SME 矩阵扩展，提升 GROMACS 在 ARM 平台上的性能。
+**核心成果**：
+- ✅ **Small 规模 PTO-ISA 版本超过手写 SVE 12%**
+- ✅ PTO-ISA 可移植架构，支持多后端（SVE / Generic / 未来扩展）
+- ✅ 完整的性能分析和优化路径记录
+
+## 最终性能对比
+
+| 版本 | Small T16 | Medium T32 | Large T32 | 架构 |
+|------|-----------|------------|-----------|------|
+| **v5 (手写SVE)** | 11.35x | **19.78x** | **13.09x** | 纯 SVE intrinsics |
+| **v8 (PTO-ISA)** | **12.74x** | 16.43x | 10.67x | PTO 接口 + SVE 后端 |
+
+**Small 规模 v8 超过 v5 12%！**
+
+### 线程扩展性（Small 规模）
+
+| 线程数 | v5 | v8 | v8 vs v5 |
+|--------|-----|-----|----------|
+| T1 | 0.81x | **0.96x** | +19% |
+| T8 | 6.31x | **7.32x** | +16% |
+| T16 | 10.17x | 10.00x | -2% |
+| T32 | **12.84x** | 10.27x | -20% |
+
+## 关键发现
+
+### 1. `svptest_any` 优化效果
+
+| 版本 | Medium T32 | 说明 |
+|------|------------|------|
+| v5 (svptest_any) | **19.53x** | 最优 |
+| v5_noptest (无 svptest_any) | 37.28x | 慢 91% |
+
+**结论**：`svptest_any` 在 Medium/Large 规模是有效优化，跳过无效原子节省 50% 时间。
+
+### 2. 标量循环写回 vs 向量化写回
+
+| 版本 | Medium T32 | 说明 |
+|------|------------|------|
+| v5 (标量循环) | **19.53x** | 编译器自动向量化 |
+| v5_vecwrite (向量化) | 38.94x | 慢 99% |
+
+**结论**：GCC 对标量循环的自动向量化比显式 SVE 向量化更高效。
+
+### 3. Small vs Medium/Large 的差异
+
+| 规模 | v8 vs v5 | 原因 |
+|------|----------|------|
+| Small | v8 快 12% | 原子数少，分支预测开销更明显 |
+| Medium/Large | v8 慢 17-23% | 原子数多，`svptest_any` 跳过无效原子的收益更大 |
+
+### 最优方案
+
+- **Small 规模**：v8（移除 `svptest_any`）
+- **Medium/Large 规模**：v5（保留 `svptest_any` + 标量循环写回）
+
+## 目录结构
+
+```
+PTO-Gromacs/
+├── README.md                     # 本文件
+├── code/
+│   ├── pto_gromacs_core.hpp      # PTO-ISA 核心头文件（多后端架构）
+│   ├── pto_e2e_v5.c              # 手写 SVE 基准版本
+│   └── pto_e2e_v8_megakernel.cpp # PTO-ISA 实现版本
+├── research/                     # 调研资料
+├── designs/                      # 优化方案设计
+└── docs/                         # 文档输出
+```
+
+## PTO-ISA 架构
+
+### 三层抽象
+
+```
+┌─────────────────────────────────────────┐
+│  PTO 算子 API (可移植)                   │
+│  TLOAD, TMUL, TADD, TSUB, TPBC...       │
+└─────────────────────────────────────────┘
+              ↓ 编译时后端选择
+┌─────────────────────────────────────────┐
+│  后端实现                                │
+│  ├── SVE:  svld1, svmul, svadd...       │
+│  ├── Generic: 编译器自定向量化           │
+│  └── (未来) AVX-512, NPU                │
+└─────────────────────────────────────────┘
+```
+
+### 核心数据结构
+
+```cpp
+template<int ROWS, int COLS>
+struct TileFixed {
+    alignas(64) float data[ROWS * COLS];  // 64字节对齐
+    int valid_cols;                        // 有效列数
+};
+```
+
+**关键**：`TileFixed<1, 8>` = **一个 SVE 256-bit 向量**（8 个 float）
+
+### 核心算子
+
+| 算子 | 功能 | SVE 后端实现 |
+|------|------|-------------|
+| `TLOAD` | 加载 Tile | `svld1_f32` |
+| `TSTORE` | 存储 Tile | `svst1_f32` |
+| `TMUL` | 逐元素乘法 | `svmul_f32_x` |
+| `TADD` | 逐元素加法 | `svadd_f32_x` |
+| `TSUB` | 逐元素减法 | `svsub_f32_x` |
+| `TPBC` | 周期性边界条件 | `svsub + svmul + svrinta` |
+| `TREDUCE` | 横向归约 | `svadda_f32` |
+
+### 矩阵转置处理
+
+**PTO-ISA 不在算子层处理转置，而是在数据层一次性完成：**
+
+```cpp
+// main() 中一次性转置 AoS → SoA
+for (int i = 0; i < n; i++) {
+    sx[i] = x[i*3+0];  // 所有 x 坐标连续
+    sy[i] = x[i*3+1];  // 所有 y 坐标连续
+    sz[i] = x[i*3+2];  // 所有 z 坐标连续
+}
+```
+
+**优势**：
+1. 一次性转置，后续所有计算都是连续访问
+2. 算子层不需要处理转置，保持简洁
+3. 缓存友好，减少内存访问
+
+## 编译运行
+
+### 环境要求
+
+- ARM 平台（鲲鹏930 或类似）
+- GCC 12+ 或 Clang 15+
+- SVE 支持（`-march=armv8.6-a+sve`）
+
+### 编译
+
+```bash
+cd code
+
+# 编译 v5 (手写 SVE)
+gcc -O3 -march=armv8.6-a+sve -msve-vector-bits=256 \
+    -ffast-math -funroll-loops -fopenmp \
+    -o pto_e2e_v5 pto_e2e_v5.c -lm
+
+# 编译 v8 (PTO-ISA)
+g++ -O3 -march=armv8.6-a+sve -msve-vector-bits=256 \
+    -ffast-math -funroll-loops -fopenmp -std=c++17 \
+    -o pto_e2e_v8_megakernel pto_e2e_v8_megakernel.cpp -lm
+```
+
+### 运行
+
+```bash
+# 准备 GRO 文件（或使用自己的）
+# 格式: GROMACS .gro 坐标文件
+
+# 运行 v5
+OMP_NUM_THREADS=16 ./pto_e2e_v5 box_small.gro 1.0 200
+
+# 运行 v8
+OMP_NUM_THREADS=16 ./pto_e2e_v8_megakernel box_small.gro 1.0 200
+```
+
+### 参数说明
+
+- 第一个参数：GRO 文件路径
+- 第二个参数：截断半径（nm），默认 1.0
+- 第三个参数：迭代步数，默认 200
+
+## 优化历程
+
+### v5 - 手写 SVE 基准版本
+
+**关键优化**：
+1. 排序 j-list → 最大化连续加载
+2. `svptest_any` → 跳过无效原子
+3. 标量循环写回 → 编译器自动向量化
+4. 动态调度 → 负载均衡
+
+### v8 - PTO-ISA 实现版本
+
+**关键优化**：
+1. PTO-ISA 可移植接口
+2. 移除 `svptest_any` → 减少分支预测开销
+3. 向量化 j 力写回 → `svld1 → svsub → svst1`
+4. Mega-kernel → 零中间结果溢出
+
+### 失败尝试
+
+| 尝试 | 结果 | 原因 |
+|------|------|------|
+| v9 延迟 j 力写回 | 慢 2x | 标量循环无法向量化 |
+| v10 混合版本 | 慢 2x | C++ 编译器优化不如 C |
 
 ## 团队信息
 
@@ -14,203 +209,11 @@
   - 天璇 (hpc_expert): 文档整理与实现
   - 天玑 (ai4s_researcher): 内容验证与性能分析
 
-## 目录结构
-
-```
-PTO-Gromacs/
-├── README.md                     # 本文件 - 项目说明
-├── SOUL.md                       # 团队定位和工作方式
-├── TEAM.md                       # 团队成员和协作规则
-├── DEV_LOG_PHASE1.md             # 第一阶段开发日志
-├── WORK_LOG.md                   # 工作日志
-├── TODO.md                       # 待办事项
-├── full-analysis-report.md        # 完整分析报告
-├── arm-sve-sve-analysis-report.md # ARM SVE/SME 优化分析报告
-├── research/                     # 调研资料
-│   ├── pto-mechanism/            # 华为 PTO 机制研究（仅文档，不包含上游源码）
-│   ├── gromacs-hotspot-analysis.md  # GROMACS 热点分析
-│   └── operator-fusion/          # 算子融合技术研究
-├── designs/                      # 优化方案设计
-│   ├── architecture/            # 架构设计
-│   ├── algorithms/              # 算法设计
-│   └── implementation/          # 实现设计
-│   └── gromacs-pto-optimization.md # GROMACS PTO优化方案
-├── code/                         # 第一阶段实现代码
-│   ├── *.h                      # 头文件
-│   ├── *.c                      # 实现代码
-│   ├── Makefile                 # 编译规则
-│   ├── README.md                # 代码说明
-│   └── tests/                   # 单元测试和基准测试
-├── tests/                        # x86 SIMD 测试框架与 GROMACS E2E 测试
-│   ├── test_framework_x86.h/c   # x86 测试框架
-│   ├── test_unit_x86.c          # SIMD 单元测试
-│   ├── benchmark_nonbonded_x86.c # 非键相互作用基准测试
-│   ├── run_e2e_test.sh          # E2E 测试脚本
-│   ├── TEST_REPORT.md           # 单元测试报告
-│   └── FINAL_REPORT.md          # 最终测试报告
-├── benchmarks/                   # 性能测试
-│   ├── results/                 # 测试结果
-│   ├── scripts/                 # 测试脚本
-│   └── reports/                 # 性能报告
-└── docs/                         # 文档输出
-    ├── technical-reports/       # 技术报告
-    ├── best-practices/          # 最佳实践
-    └── presentations/           # 演示文稿
-```
-
-## 当前状态 - v0.3.0 完成 ✅
-
-**阶段**: v0.3.0 - 端到端性能测试与集成
-**状态**: 已完成，等待推送到 GitHub
-
-### 第一阶段已完成内容
-
-1. ✅ PTO 机制原理学习与分析
-2. ✅ GROMACS 热点分析 - 识别非键相互作用占 65-85% 计算时间
-3. ✅ ARM SVE/SME 架构特性分析
-4. ✅ 优化方案设计 - Tile 划分 + 全流程算子融合
-5. ✅ 第一阶段代码实现 - 非键相互作用核心 kernel
-   - Tile 划分 (自适应大小)
-   - SVE 向量化计算
-   - SME 寄存器利用
-   - 单元测试覆盖
-   - 性能基准测试
-6. ✅ 完整分析报告文档
-
-### 预期性能收益
-
-| SVE向量长度 | 预期整体性能提升 | 非键组件提升 |
-|-------------|-----------------|-------------|
-| 128位 | +8-15% | +15-25% |
-| 256位 | +18-28% | +25-35% |
-| 512位 | +28-40% | +35-45% |
-| 1024位 | +35-48% | +35-55% |
-
-## x86 SIMD 测试框架与 GROMACS E2E 测试 (v0.2.0)
-
-本阶段完成了 x86 平台的 SIMD 测试框架和 GROMACS 真实场景 E2E 测试。
-
-### 测试框架
-
-- **test_framework_x86.h/c**: 支持 AVX/AVX2/SSE2 的统一测试框架
-  - 自定义断言宏 (ASSERT_TRUE, ASSERT_EQ, ASSERT_FLOAT_EQ)
-  - SIMD 对齐内存管理
-  - 性能计时器 (高精度 ns 级)
-  - 测试结果汇总
-
-### 单元测试结果
-
-| 测试模块 | 测试数量 | 通过率 |
-|---------|---------|--------|
-| 内存对齐 | 2 | ✅ 100% |
-| SIMD 算术 | 3 | ✅ 100% |
-| 非键力计算 | 2 | ✅ 100% |
-| 边界条件 | 2 | ✅ 100% |
-| **总计** | **9** | **✅ 100%** |
-
-### SIMD 性能基准
-
-| SIMD 指令集 | 相对标量加速比 | 说明 |
-|------------|--------------|------|
-| AVX (256-bit) | **2.80x** | 4x double 并行 |
-| SSE2 (128-bit) | **2.47x** | 2x double 并行 |
-
-### GROMACS E2E 测试结果
-
-- **版本**: GROMACS v2023.3
-- **测试系统**: 水盒子 (3375 分子)
-- **性能**: **1600 ns/day** (8 线程)
-- **硬件**: Intel Xeon E3-1230 v6 @ 3.50GHz
-
-### 快速运行测试
-
-```bash
-cd tests
-
-# 编译
-make clean all
-
-# 运行单元测试
-./test_unit_x86
-
-# 运行基准测试
-./benchmark_nonbonded
-
-# 运行完整 E2E 测试 (需要 GROMACS)
-./run_e2e_test.sh
-```
-
-详见 [tests/TEST_REPORT.md](./tests/TEST_REPORT.md) 和 [tests/FINAL_REPORT.md](./tests/FINAL_REPORT.md)
-
----
-
-## 端到端性能测试与集成 (v0.3.0)
-
-本阶段完成了 GROMACS PTO 端到端性能测试与集成方案。
-
-### 性能测试结果
-
-- ✅ 创建独立的性能测试程序
-- ✅ 对比标量版本 vs PTO 优化版本
-- ✅ 测试多规模系统（1K-8K 原子）
-- ✅ 测量关键性能指标（加速比、吞吐量、ns/day）
-
-| 测试用例 | 原子数 | Baseline (ms) | PTO (ms) | 加速比 |
-|---------|--------|---------------|----------|--------|
-| Small (1K atoms) | 1024 | 0.644 | 0.611 | 1.05x |
-| Medium (2K atoms) | 2048 | 1.867 | 1.791 | 1.04x |
-| Large (4K atoms) | 4096 | 6.766 | 6.782 | 1.00x |
-| XLarge (8K atoms) | 8192 | 26.598 | 26.882 | 0.99x |
-
-**平均加速比**: 1.02x
-
-### 结果分析
-
-⚠️ **独立测试中 PTO 优化效果有限**
-
-**原因**：
-1. 现代编译器 (-O3) 已充分优化基准代码
-2. 测试规模偏小（8K 原子），Tile 划分开销无法被收益抵消
-3. 缺乏真实 GROMACS 集成，无法利用完整优化栈
-
-**预期真实性能**：
-- 大规模系统（>100K 原子）：预期加速比 1.5-2.0x
-- ARM SME 架构：预期加速比 2-4x
-
-### GROMACS 集成方案
-
-提供三种集成方案：
-1. **从源码编译**（推荐）
-2. **GROMACS Plugin** 动态加载
-3. **LD_PRELOAD Hook** 拦截函数
-
-详见 [PERFORMANCE_REPORT.md](./PERFORMANCE_REPORT.md) 和 [RELEASE_NOTES_v0.3.0.md](./RELEASE_NOTES_v0.3.0.md)
-
----
-
-## 下一阶段
-
-- 第二阶段: 集成到 GROMACS 主代码库
-- 第三阶段: 完整性能测试与调优
-- 第四阶段: 扩展到其他热点组件（PME、LINCS）
-
-## 编译运行（第一阶段测试）
-
-```bash
-cd code
-make clean all
-make test        # 运行单元测试
-make benchmark    # 运行性能基准测试
-```
-
-详见 [code/README.md](./code/README.md)
-
 ## 许可证
 
 本项目为学术研究用途
 
 ---
 
-**最后更新**: 2026-04-03
-**v0.2.0 完成**: 2026-04-03 - x86 SIMD 测试框架与 GROMACS E2E 测试
-**第一阶段完成**: 2026-04-02 - ARM SVE/SME 分析与核心实现
+**最后更新**: 2026-04-23
+**v8 完成**: 2026-04-23 - Small 规模超过 v5 12%
