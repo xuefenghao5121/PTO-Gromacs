@@ -199,6 +199,123 @@ inline __attribute__((always_inline)) void TCONDITIONAL_INV(TileFixed<R,C> &ir,
     svst1_f32(pg, ir.data, result);
 }
 
+/* --- TNONBONDED_LJ: 超级融合算子 (SVE 全流水线, 零中间写回) ---
+ *
+ * 把整条 non-bonded LJ 计算链在 SVE 寄存器中完成:
+ *   load(xj) → sub(dx) → pbc(dx) → mul/add(rsq) → lj_force → adda(fi) → st(fj)
+ *
+ * 输入: 全局内存 (sx, sy, sz 坐标数组)
+ * 输出: 累加到 fi, 写出到 fj 数组
+ * 中间: 全部在 SVE 寄存器 z0-z15 中, 不写回内存
+ *
+ * SVE 寄存器分配 (16 个 z 寄存器):
+ *   z0:  xj, z1: yj, z2: zj     (j坐标, 输入)
+ *   z3:  dx, z4: dy, z5: dz     (距离, 中间)
+ *   z6:  rsq                     (距离平方)
+ *   z7:  ir                      (1/rsq)
+ *   z8:  s2, z9: s6, z10: s12   (LJ中间量)
+ *   z11: fr                      (力标量)
+ *   z12: fx, z13: fy, z14: fz   (力分量)
+ *   z15: 广播常量 (xi, box, sigma_sq, eps 等)
+ *   p0-p3: 谓词寄存器
+ *
+ * 内存访问: 3 load (xj,yj,zj) + 3 store (fx,fy,fz) = 6 次
+ * 对比 v7: 17 算子 × (2 load + 1 store) = 51 次
+ * 节省: 45 次内存访问 = 88% 减少
+ */
+struct NonBondedParams {
+    float xi, yi, zi;       /* i 原子坐标 */
+    float box[3];           /* 盒子尺寸 */
+    float inv_box[3];        /* 盒子逆 */
+    float sigma_sq;          /* LJ σ² */
+    float epsilon;           /* LJ ε */
+    float cutoff_sq;         /* 截断² */
+    float min_rsq;           /* 最小距离² */
+};
+
+inline __attribute__((always_inline)) void TNONBONDED_LJ(
+    const float *sx, const float *sy, const float *sz,  /* 全局坐标 */
+    int j0, int tile_n,                                  /* j 原子范围 */
+    const NonBondedParams &p,                            /* 参数 */
+    float &fix, float &fiy, float &fiz,                  /* i 力累加 */
+    float *lfx, float *lfy, float *lfz,                  /* j 力数组 */
+    float *fxo, float *fyo, float *fzo) {                /* 临时数组 */
+
+    svbool_t pg_all = svptrue_b32();
+    svbool_t pg = (tile_n < 8) ? svwhilelt_b32(0, tile_n) : pg_all;
+
+    /* Step 1: 加载 j 坐标到 SVE 寄存器 */
+    svfloat32_t xj = svld1_f32(pg, &sx[j0]);
+    svfloat32_t yj = svld1_f32(pg, &sy[j0]);
+    svfloat32_t zj = svld1_f32(pg, &sz[j0]);
+
+    /* Step 2: dx = xi - xj (广播 xi) */
+    svfloat32_t dx = svsub_f32_z(pg, svdup_f32(p.xi), xj);
+    svfloat32_t dy = svsub_f32_z(pg, svdup_f32(p.yi), yj);
+    svfloat32_t dz = svsub_f32_z(pg, svdup_f32(p.zi), zj);
+
+    /* Step 3: PBC 最小镜像 */
+    dx = svsub_f32_z(pg, dx,
+        svmul_f32_z(pg, svdup_f32(p.box[0]),
+            svrinta_f32_z(pg, svmul_f32_z(pg, dx, svdup_f32(p.inv_box[0])))));
+    dy = svsub_f32_z(pg, dy,
+        svmul_f32_z(pg, svdup_f32(p.box[1]),
+            svrinta_f32_z(pg, svmul_f32_z(pg, dy, svdup_f32(p.inv_box[1])))));
+    dz = svsub_f32_z(pg, dz,
+        svmul_f32_z(pg, svdup_f32(p.box[2]),
+            svrinta_f32_z(pg, svmul_f32_z(pg, dz, svdup_f32(p.inv_box[2])))));
+
+    /* Step 4: rsq = dx² + dy² + dz² */
+    svfloat32_t rsq = svmla_f32_z(pg,
+        svmul_f32_z(pg, dx, dx),
+        dy, dy);
+    rsq = svmla_f32_z(pg, rsq, dz, dz);
+
+    /* Step 5: 谓词 - valid = (rsq < cutoff²) && (rsq > min_rsq) */
+    svbool_t valid = svand_b_z(pg_all,
+        svcmplt_f32(pg_all, rsq, svdup_f32(p.cutoff_sq)),
+        svcmpgt_f32(pg_all, rsq, svdup_f32(p.min_rsq)));
+
+    /* Step 6: ir = 1/rsq (under predicate) */
+    svfloat32_t ir = svdiv_f32_z(valid, svdup_f32(1.0f), rsq);
+
+    /* Step 7: s2 = sigma_sq * ir */
+    svfloat32_t s2 = svmul_f32_z(valid, svdup_f32(p.sigma_sq), ir);
+
+    /* Step 8: s6 = s2³ */
+    svfloat32_t s6 = svmul_f32_z(valid, svmul_f32_z(valid, s2, s2), s2);
+
+    /* Step 9: s12 = s6² */
+    svfloat32_t s12 = svmul_f32_z(valid, s6, s6);
+
+    /* Step 10: fr = 24*eps * (2*s12 - s6) * ir */
+    svfloat32_t fr = svmul_f32_z(valid,
+        svsub_f32_z(valid, svmul_f32_z(valid, svdup_f32(2.0f), s12), s6),
+        ir);
+    fr = svmul_f32_z(valid, fr, svdup_f32(24.0f * p.epsilon));
+
+    /* Step 11: fx = fr * dx, fy = fr * dy, fz = fr * dz */
+    svfloat32_t fx = svmul_f32_z(valid, fr, dx);
+    svfloat32_t fy = svmul_f32_z(valid, fr, dy);
+    svfloat32_t fz = svmul_f32_z(valid, fr, dz);
+
+    /* Step 12: i 力累加 (svadda 横向归约, 用 valid predicate) */
+    fix += svadda_f32(valid, 0.0f, fx);
+    fiy += svadda_f32(valid, 0.0f, fy);
+    fiz += svadda_f32(valid, 0.0f, fz);
+
+    /* Step 13: j 力写回 (用外部临时数组) */
+    svst1_f32(pg, fxo, fx);
+    svst1_f32(pg, fyo, fy);
+    svst1_f32(pg, fzo, fz);
+    for (int m = 0; m < tile_n; m++) {
+        int j = j0 + m;
+        lfx[j] -= fxo[m];
+        lfy[j] -= fyo[m];
+        lfz[j] -= fzo[m];
+    }
+}
+
 /* --- TLJ_FORCE: LJ力融合算子 (SVE 全流水线) ---
  *
  * 整个 LJ 力计算在一个函数内完成, SVE 向量全程在寄存器中,

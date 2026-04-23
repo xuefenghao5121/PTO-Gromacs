@@ -45,6 +45,10 @@ e2e: $(OBJECTS) $(E2E_SOURCES)
 benchmark: $(OBJECTS) $(E2E_BENCHMARK_SOURCES)
 	$(CC) $(CFLAGS) $(E2E_BENCHMARK_SOURCES) $(OBJECTS) -o pto_e2e_benchmark $(LDFLAGS)
 
+# ===== PTO-ISA v8 (Mega-Kernel, Zero-Spill) =====
+v8: pto_e2e_v8_megakernel.cpp pto_gromacs_core.hpp
+	$(CXX) $(PTO_CXXFLAGS) $< -o pto_e2e_v8_megakernel $(PTO_LDFLAGS)
+
 # ===== PTO-ISA v7 (C++ + SVE backend) =====
 CXX ?= g++
 PTO_CXXFLAGS = -O3 -march=armv8.6-a+sve -msve-vector-bits=256
