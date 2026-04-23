@@ -1,18 +1,18 @@
 /**
- * PTO-GROMACS v6 — PTO-ISA 核心算子实现
+ * PTO-GROMACS v7 — PTO-ISA 多后端算子实现
  *
- * 直接提取 PTO-ISA CPU 模拟层的核心算子:
- * - TileShape2D: PTO Tile 形状描述
- * - PTO_CPU_VECTORIZE_LOOP: 编译器向量化提示
- * - TMUL, TSUB, TADD, TDIV: 逐元素算子 (从 PTO-ISA CPU 实现提取)
- * - TLOAD, TSTORE: 数据搬运
- * - TROWTSUM: 行归约
+ * 核心架构:
+ *   PTO-ISA API (可移植接口)
+ *       ↓  编译时选择
+ *   Backend Implementation
+ *       ├── ARM SVE:  svld1_f32, svmul_f32_x, svsub_f32_x ...
+ *       ├── Generic:  PTO_CPU_VECTORIZE_LOOP + for loop
+ *       └── (future) x86 AVX-512, NPU native
  *
- * 这些算子直接来自 pto-isa/include/pto/cpu/*.hpp,
- * 但去掉了 NPU 相关的宏和头文件依赖,
- * 使其在 GCC 12 + C++17 + ARM SVE 上可编译。
+ * 当 COLS == SVE_VECTOR_BITS/32 时, 每个 PTO 算子
+ * 1:1 映射到一条 SVE 指令, 性能等价于手写 SVE intrinsics。
  *
- * 参考: third_party/pto-isa/include/pto/cpu/{TMul,TSub,TAdd,TDiv,TRowSum}.hpp
+ * 参考: third_party/pto-isa/include/pto/cpu/*.hpp (NPU 原始实现)
  */
 
 #ifndef PTO_GROMACS_CORE_HPP
@@ -25,40 +25,46 @@
 #include <omp.h>
 
 /* ====================================================================
- * PTO 编译器向量化提示 (from pto/cpu/parallel.hpp)
+ * Backend Selection
+ *
+ * HAVE_SVE: 使用 ARM SVE intrinsics 后端 (最优)
+ * 否则:     使用 Generic CPU 后端 (编译器自定向量化)
  * ==================================================================== */
-#if defined(__clang__)
-#define PTO_CPU_PRAGMA(X) _Pragma(#X)
-#define PTO_CPU_VECTORIZE_LOOP PTO_CPU_PRAGMA(clang loop vectorize(enable) interleave(enable))
-#elif defined(__GNUC__)
-#define PTO_CPU_PRAGMA(X) _Pragma(#X)
-#define PTO_CPU_VECTORIZE_LOOP PTO_CPU_PRAGMA(GCC ivdep)
+#if defined(HAVE_SVE) && defined(__ARM_FEATURE_SVE)
+  #include <arm_sve.h>
+  #define PTO_BACKEND_SVE 1
 #else
-#define PTO_CPU_VECTORIZE_LOOP
+  #define PTO_BACKEND_SVE 0
+  /* Generic backend: compiler vectorization hints */
+  #if defined(__clang__)
+    #define PTO_CPU_PRAGMA(X) _Pragma(#X)
+    #define PTO_CPU_VECTORIZE_LOOP PTO_CPU_PRAGMA(clang loop vectorize(enable) interleave(enable))
+  #elif defined(__GNUC__)
+    #define PTO_CPU_PRAGMA(X) _Pragma(#X)
+    #define PTO_CPU_VECTORIZE_LOOP PTO_CPU_PRAGMA(GCC ivdep)
+  #else
+    #define PTO_CPU_VECTORIZE_LOOP
+  #endif
 #endif
 
 namespace pto {
 namespace cpu {
 
 /* ====================================================================
- * PTO Tile: 编译时固定大小的2D数据块
+ * PTO Tile: 编译时固定大小的数据块
  *
- * 使用模板参数固定 rows/cols, 使编译器能在编译时确定循环次数,
- * 实现完整的 SVE 向量化、循环展开和软件流水线。
- *
- * 对比 v6.0 (运行时 Tile2D):
- *   - v6.0: for(int i=0; i<tile.cols; i++) → 编译器不知道cols=8
- *   - v6.1: for(int i=0; i<COLS; i++) → 编译器知道COLS=8, 完全展开
+ * SVE 后端: Tile 大小 = SVE 向量宽度 (256-bit = 8 floats)
+ *           每个 PTO 算子 = 一条 SVE 指令
+ * Generic 后端: Tile 大小 = 编译时常量, 依赖循环展开
  * ==================================================================== */
 template<int ROWS, int COLS>
 struct TileFixed {
     alignas(64) float data[ROWS * COLS];
-    int valid_cols; /* 运行时有效列数 (≤ COLS) */
+    int valid_cols;
 
     TileFixed() : valid_cols(COLS) {}
     void SetValidCols(int vc) { valid_cols = vc; }
 
-    /* 编译时大小 */
     static constexpr int rows() { return ROWS; }
     static constexpr int cols() { return COLS; }
     static constexpr int size() { return ROWS * COLS; }
@@ -76,8 +82,196 @@ struct GlobalTensor1D {
 };
 
 /* ====================================================================
- * PTO 算子: TLOAD — 全局→Tile (编译时展开版)
+ * PTO 算子参数
  * ==================================================================== */
+template<int R, int C>
+struct LJParamsT {
+    float sigma_sq;
+    float epsilon;
+    float cutoff_sq;
+    float min_rsq;
+};
+
+/* ====================================================================
+ * ================================================================== *
+ *  ARM SVE Backend                                                    *
+ *  每个 PTO 算子直接映射到 SVE intrinsics                            *
+ *  TileFixed<1,8> 的 data[8] = 一个 SVE 256-bit 向量                 *
+ * ================================================================== *
+ * ==================================================================== */
+#if PTO_BACKEND_SVE
+
+/* --- TLOAD: svld1_f32 --- */
+template<int R, int C>
+inline __attribute__((always_inline)) void TLOAD(TileFixed<R,C> &dst, const GlobalTensor1D &src) {
+    svbool_t pg = svptrue_b32();
+    if (src.stride == 1) {
+        /* 连续加载: 等价于 svld1 */
+        svfloat32_t v = svld1_f32(pg, src.data);
+        svst1_f32(pg, dst.data, v);
+    } else {
+        /* 带步幅: gather */
+        svint32_t idx = svindex_s32(0, src.stride);
+        svfloat32_t v = svld1_gather_s32index_f32(pg, src.data, idx);
+        svst1_f32(pg, dst.data, v);
+    }
+}
+
+/* --- TFILL: svdup_f32 --- */
+template<int R, int C>
+inline __attribute__((always_inline)) void TFILL(TileFixed<R,C> &dst, float value) {
+    svfloat32_t v = svdup_f32(value);
+    svst1_f32(svptrue_b32(), dst.data, v);
+}
+
+/* --- TMUL: svmul_f32_x --- */
+template<int R, int C>
+inline __attribute__((always_inline)) void TMUL(TileFixed<R,C> &dst,
+    const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t a = svld1_f32(pg, src0.data);
+    svfloat32_t b = svld1_f32(pg, src1.data);
+    svfloat32_t r = svmul_f32_x(pg, a, b);
+    svst1_f32(pg, dst.data, r);
+}
+
+/* --- TADD: svadd_f32_x --- */
+template<int R, int C>
+inline __attribute__((always_inline)) void TADD(TileFixed<R,C> &dst,
+    const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t a = svld1_f32(pg, src0.data);
+    svfloat32_t b = svld1_f32(pg, src1.data);
+    svfloat32_t r = svadd_f32_x(pg, a, b);
+    svst1_f32(pg, dst.data, r);
+}
+
+/* --- TSUB: svsub_f32_x --- */
+template<int R, int C>
+inline __attribute__((always_inline)) void TSUB(TileFixed<R,C> &dst,
+    const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t a = svld1_f32(pg, src0.data);
+    svfloat32_t b = svld1_f32(pg, src1.data);
+    svfloat32_t r = svsub_f32_x(pg, a, b);
+    svst1_f32(pg, dst.data, r);
+}
+
+/* --- TDIV: svdiv_f32_z (条件) --- */
+template<int R, int C>
+inline __attribute__((always_inline)) void TDIV(TileFixed<R,C> &dst,
+    const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t a = svld1_f32(pg, src0.data);
+    svfloat32_t b = svld1_f32(pg, src1.data);
+    svbool_t nz = svcmpne_f32(pg, b, svdup_f32(0.0f));
+    svfloat32_t r = svdiv_f32_z(nz, a, b);
+    svst1_f32(pg, dst.data, r);
+}
+
+/* --- TPBC: PBC 最小镜像 ---
+ * dx -= box * rint(dx * inv_box)
+ * SVE: svmul → svrinta → svmul → svsub
+ */
+template<int R, int C>
+inline __attribute__((always_inline)) void TPBC(TileFixed<R,C> &dx, float box, float inv_box) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t v = svld1_f32(pg, dx.data);
+    v = svsub_f32_x(pg, v,
+        svmul_f32_x(pg, svdup_f32(box),
+            svrinta_f32_x(pg, svmul_f32_x(pg, v, svdup_f32(inv_box)))));
+    svst1_f32(pg, dx.data, v);
+}
+
+/* --- TCONDITIONAL_INV: 条件逆 (SVE predicate) ---
+ * ir = (rsq < csq && rsq > eps) ? 1/rsq : 0
+ * SVE: svcmplt + svcmpgt → svand → svdiv_f32_z
+ */
+template<int R, int C>
+inline __attribute__((always_inline)) void TCONDITIONAL_INV(TileFixed<R,C> &ir,
+    const TileFixed<R,C> &rsq, float csq, float eps = 1e-8f) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t r = svld1_f32(pg, rsq.data);
+    svbool_t valid = svand_b_z(pg,
+        svcmplt_f32(pg, r, svdup_f32(csq)),
+        svcmpgt_f32(pg, r, svdup_f32(eps)));
+    svfloat32_t result = svdiv_f32_z(valid, svdup_f32(1.0f), r);
+    svst1_f32(pg, ir.data, result);
+}
+
+/* --- TLJ_FORCE: LJ力融合算子 (SVE 全流水线) ---
+ *
+ * 整个 LJ 力计算在一个函数内完成, SVE 向量全程在寄存器中,
+ * 不写回内存 → 真正的算子融合。
+ *
+ * SVE 寄存器分配 (最多需要 ~14 个 z 寄存器, SVE 有 32 个):
+ *   z0: dx, z1: dy, z2: dz     (距离, 输入)
+ *   z3: rsq                      (距离平方)
+ *   z4: ir                       (1/rsq)
+ *   z5: s2, z6: s6, z7: s12     (LJ 中间量)
+ *   z8: fr                       (力标量)
+ *   z9: fx, z10: fy, z11: fz    (力分量, 输出)
+ *   z12-z15: 临时
+ *   z16: 广播常量
+ */
+template<int R, int C>
+inline __attribute__((always_inline)) void TLJ_FORCE(
+    TileFixed<R,C> &fx_out, TileFixed<R,C> &fy_out, TileFixed<R,C> &fz_out,
+    const TileFixed<R,C> &dx_in, const TileFixed<R,C> &dy_in, const TileFixed<R,C> &dz_in,
+    const TileFixed<R,C> &rsq_in, const LJParamsT<R,C> &params,
+    /* 临时 Tile (SVE后端不需要实际使用, 但保持接口一致) */
+    TileFixed<R,C> &, TileFixed<R,C> &, TileFixed<R,C> &, TileFixed<R,C> &,
+    TileFixed<R,C> &, TileFixed<R,C> &, TileFixed<R,C> &) {
+
+    svbool_t pg = svptrue_b32();
+
+    /* 加载输入到 SVE 寄存器 */
+    svfloat32_t dx  = svld1_f32(pg, dx_in.data);
+    svfloat32_t dy  = svld1_f32(pg, dy_in.data);
+    svfloat32_t dz  = svld1_f32(pg, dz_in.data);
+    svfloat32_t rsq = svld1_f32(pg, rsq_in.data);
+
+    /* 条件逆: ir = 1/rsq (under predicate) */
+    svbool_t valid = svand_b_z(pg,
+        svcmplt_f32(pg, rsq, svdup_f32(params.cutoff_sq)),
+        svcmpgt_f32(pg, rsq, svdup_f32(params.min_rsq)));
+    svfloat32_t ir = svdiv_f32_z(valid, svdup_f32(1.0f), rsq);
+
+    /* s2 = sigma_sq * ir */
+    svfloat32_t s2 = svmul_f32_z(valid, svdup_f32(params.sigma_sq), ir);
+
+    /* s6 = s2 * s2 * s2 */
+    svfloat32_t s6 = svmul_f32_z(valid, svmul_f32_z(valid, s2, s2), s2);
+
+    /* s12 = s6 * s6 */
+    svfloat32_t s12 = svmul_f32_z(valid, s6, s6);
+
+    /* fr = 24*eps * (2*s12 - s6) * ir */
+    svfloat32_t fr = svmul_f32_z(valid,
+        svsub_f32_z(valid, svmul_f32_z(valid, svdup_f32(2.0f), s12), s6),
+        ir);
+    fr = svmul_f32_z(valid, fr, svdup_f32(24.0f * params.epsilon));
+
+    /* fx = fr * dx, fy = fr * dy, fz = fr * dz */
+    svfloat32_t fx = svmul_f32_z(valid, fr, dx);
+    svfloat32_t fy = svmul_f32_z(valid, fr, dy);
+    svfloat32_t fz = svmul_f32_z(valid, fr, dz);
+
+    /* 存储输出 (全部 valid 外的位置为 0, 由 _z 清零) */
+    svst1_f32(pg, fx_out.data, fx);
+    svst1_f32(pg, fy_out.data, fy);
+    svst1_f32(pg, fz_out.data, fz);
+}
+
+/* ====================================================================
+ * ================================================================== *
+ *  Generic CPU Backend (编译器自定向量化)                              *
+ *  用于不支持 SVE 的平台 (x86, 旧ARM 等)                             *
+ * ================================================================== *
+ * ==================================================================== */
+#else /* !PTO_BACKEND_SVE */
+
+/* --- TLOAD --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TLOAD(TileFixed<R,C> &dst, const GlobalTensor1D &src) {
     if (src.stride == 1) {
@@ -89,18 +283,14 @@ inline __attribute__((always_inline)) void TLOAD(TileFixed<R,C> &dst, const Glob
     }
 }
 
-/* ====================================================================
- * PTO 算子: TFILL — 填充常量 (编译时展开)
- * ==================================================================== */
+/* --- TFILL --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TFILL(TileFixed<R,C> &dst, float value) {
     PTO_CPU_VECTORIZE_LOOP
     for (int i = 0; i < C; i++) dst.data[i] = value;
 }
 
-/* ====================================================================
- * PTO 算子: TMUL — 逐元素乘法 (编译时展开)
- * ==================================================================== */
+/* --- TMUL --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TMUL(TileFixed<R,C> &dst,
     const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
@@ -108,9 +298,7 @@ inline __attribute__((always_inline)) void TMUL(TileFixed<R,C> &dst,
     for (int i = 0; i < C; i++) dst.data[i] = src0.data[i] * src1.data[i];
 }
 
-/* ====================================================================
- * PTO 算子: TADD — 逐元素加法 (编译时展开)
- * ==================================================================== */
+/* --- TADD --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TADD(TileFixed<R,C> &dst,
     const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
@@ -118,9 +306,7 @@ inline __attribute__((always_inline)) void TADD(TileFixed<R,C> &dst,
     for (int i = 0; i < C; i++) dst.data[i] = src0.data[i] + src1.data[i];
 }
 
-/* ====================================================================
- * PTO 算子: TSUB — 逐元素减法 (编译时展开)
- * ==================================================================== */
+/* --- TSUB --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TSUB(TileFixed<R,C> &dst,
     const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
@@ -128,9 +314,7 @@ inline __attribute__((always_inline)) void TSUB(TileFixed<R,C> &dst,
     for (int i = 0; i < C; i++) dst.data[i] = src0.data[i] - src1.data[i];
 }
 
-/* ====================================================================
- * PTO 算子: TDIV — 逐元素除法 (编译时展开)
- * ==================================================================== */
+/* --- TDIV --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TDIV(TileFixed<R,C> &dst,
     const TileFixed<R,C> &src0, const TileFixed<R,C> &src1) {
@@ -140,18 +324,14 @@ inline __attribute__((always_inline)) void TDIV(TileFixed<R,C> &dst,
     }
 }
 
-/* ====================================================================
- * PTO 算子: TPBC — PBC 最小镜像 (编译时展开)
- * ==================================================================== */
+/* --- TPBC --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TPBC(TileFixed<R,C> &dx, float box, float inv_box) {
     PTO_CPU_VECTORIZE_LOOP
     for (int i = 0; i < C; i++) dx.data[i] -= box * rintf(dx.data[i] * inv_box);
 }
 
-/* ====================================================================
- * PTO 算子: TCONDITIONAL_INV — 条件逆 (编译时展开)
- * ==================================================================== */
+/* --- TCONDITIONAL_INV --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TCONDITIONAL_INV(TileFixed<R,C> &ir,
     const TileFixed<R,C> &rsq, float csq, float eps = 1e-8f) {
@@ -161,17 +341,7 @@ inline __attribute__((always_inline)) void TCONDITIONAL_INV(TileFixed<R,C> &ir,
     }
 }
 
-/* ====================================================================
- * PTO 算子: TLJ_FORCE — LJ 力融合算子 (编译时展开)
- * ==================================================================== */
-template<int R, int C>
-struct LJParamsT {
-    float sigma_sq;
-    float epsilon;
-    float cutoff_sq;
-    float min_rsq;
-};
-
+/* --- TLJ_FORCE (Generic) --- */
 template<int R, int C>
 inline __attribute__((always_inline)) void TLJ_FORCE(
     TileFixed<R,C> &fx, TileFixed<R,C> &fy, TileFixed<R,C> &fz,
@@ -197,9 +367,7 @@ inline __attribute__((always_inline)) void TLJ_FORCE(
     TMUL(fz, fr, dz);
 }
 
-/* ====================================================================
- * 运行时 Tile2D (向后兼容, 用于 dynamic 场景)
- * ==================================================================== */
+#endif /* PTO_BACKEND_SVE */
 
 } // namespace cpu
 } // namespace pto

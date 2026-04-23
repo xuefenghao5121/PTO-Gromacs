@@ -261,7 +261,7 @@ int main(int argc, char *argv[]) {
     int nt = omp_get_max_threads();
 
     printf("================================================================\n");
-    printf("  PTO-GROMACS v6 — PTO-ISA Operator Fusion (CPU Sim + SVE)\n");
+    printf("  PTO-GROMACS v7 — PTO-ISA + SVE Backend\n");
     printf("================================================================\n");
     printf("Atoms: %d | Box: %.1fx%.1fx%.1f | Cut: %.2f | Steps: %d\n",
            n, g->box[0],g->box[1],g->box[2], cut, steps);
