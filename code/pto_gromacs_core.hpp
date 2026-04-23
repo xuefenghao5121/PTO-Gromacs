@@ -250,26 +250,25 @@ inline __attribute__((always_inline)) void TNONBONDED_LJ(
     svfloat32_t zj = svld1_f32(pg, &sz[j0]);
 
     /* Step 2: dx = xi - xj (广播 xi) */
-    svfloat32_t dx = svsub_f32_z(pg, svdup_f32(p.xi), xj);
-    svfloat32_t dy = svsub_f32_z(pg, svdup_f32(p.yi), yj);
-    svfloat32_t dz = svsub_f32_z(pg, svdup_f32(p.zi), zj);
+    svfloat32_t dx = svsub_f32_x(pg, svdup_f32(p.xi), xj);
+    svfloat32_t dy = svsub_f32_x(pg, svdup_f32(p.yi), yj);
+    svfloat32_t dz = svsub_f32_x(pg, svdup_f32(p.zi), zj);
 
     /* Step 3: PBC 最小镜像 */
-    dx = svsub_f32_z(pg, dx,
-        svmul_f32_z(pg, svdup_f32(p.box[0]),
-            svrinta_f32_z(pg, svmul_f32_z(pg, dx, svdup_f32(p.inv_box[0])))));
-    dy = svsub_f32_z(pg, dy,
-        svmul_f32_z(pg, svdup_f32(p.box[1]),
-            svrinta_f32_z(pg, svmul_f32_z(pg, dy, svdup_f32(p.inv_box[1])))));
-    dz = svsub_f32_z(pg, dz,
-        svmul_f32_z(pg, svdup_f32(p.box[2]),
-            svrinta_f32_z(pg, svmul_f32_z(pg, dz, svdup_f32(p.inv_box[2])))));
+    dx = svsub_f32_x(pg, dx,
+        svmul_f32_x(pg, svdup_f32(p.box[0]),
+            svrinta_f32_x(pg, svmul_f32_x(pg, dx, svdup_f32(p.inv_box[0])))));
+    dy = svsub_f32_x(pg, dy,
+        svmul_f32_x(pg, svdup_f32(p.box[1]),
+            svrinta_f32_x(pg, svmul_f32_x(pg, dy, svdup_f32(p.inv_box[1])))));
+    dz = svsub_f32_x(pg, dz,
+        svmul_f32_x(pg, svdup_f32(p.box[2]),
+            svrinta_f32_x(pg, svmul_f32_x(pg, dz, svdup_f32(p.inv_box[2])))));
 
     /* Step 4: rsq = dx² + dy² + dz² */
-    svfloat32_t rsq = svmla_f32_z(pg,
-        svmul_f32_z(pg, dx, dx),
-        dy, dy);
-    rsq = svmla_f32_z(pg, rsq, dz, dz);
+    svfloat32_t rsq = svadd_f32_x(pg, svadd_f32_x(pg,
+        svmul_f32_x(pg, dx, dx), svmul_f32_x(pg, dy, dy)),
+        svmul_f32_x(pg, dz, dz));
 
     /* Step 5: 谓词 - valid = (rsq < cutoff²) && (rsq > min_rsq) */
     svbool_t valid = svand_b_z(pg_all,
