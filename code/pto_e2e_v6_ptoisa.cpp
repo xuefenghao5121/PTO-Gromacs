@@ -120,7 +120,7 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
                                  float *f_aos, int n, float box[3],
                                  NBList *nl, float cut, int nt,
                                  float *all_lfx, float *all_lfy, float *all_lfz) {
-    LJParams lj_params;
+    LJParamsT<1, TILE_COLS> lj_params;
     lj_params.sigma_sq = 0.09f;
     lj_params.epsilon = 0.5f;
     lj_params.cutoff_sq = cut * cut;
@@ -140,35 +140,15 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
         float *lfy = all_lfy + (size_t)tid * n;
         float *lfz = all_lfz + (size_t)tid * n;
 
-        /* ===== PTO Tile 分配 (栈上, 模拟 NPU UB) ===== */
-        alignas(64) float buf_xj[TILE_COLS], buf_yj[TILE_COLS], buf_zj[TILE_COLS];
-        alignas(64) float buf_dx[TILE_COLS], buf_dy[TILE_COLS], buf_dz[TILE_COLS];
-        alignas(64) float buf_xi[TILE_COLS], buf_yi_buf[TILE_COLS], buf_zi_buf[TILE_COLS];
-        alignas(64) float buf_rsq[TILE_COLS], buf_ir[TILE_COLS];
-        alignas(64) float buf_s2[TILE_COLS], buf_s6[TILE_COLS], buf_s12[TILE_COLS];
-        alignas(64) float buf_fr[TILE_COLS], buf_tmp[TILE_COLS], buf_ones[TILE_COLS];
-        alignas(64) float buf_fx[TILE_COLS], buf_fy[TILE_COLS], buf_fz[TILE_COLS];
-
-        Tile2D tile_xj(buf_xj, 1, TILE_COLS);
-        Tile2D tile_yj(buf_yj, 1, TILE_COLS);
-        Tile2D tile_zj(buf_zj, 1, TILE_COLS);
-        Tile2D tile_dx(buf_dx, 1, TILE_COLS);
-        Tile2D tile_dy(buf_dy, 1, TILE_COLS);
-        Tile2D tile_dz(buf_dz, 1, TILE_COLS);
-        Tile2D tile_xi(buf_xi, 1, TILE_COLS);
-        Tile2D tile_yi(buf_yi_buf, 1, TILE_COLS);
-        Tile2D tile_zi(buf_zi_buf, 1, TILE_COLS);
-        Tile2D tile_rsq(buf_rsq, 1, TILE_COLS);
-        Tile2D tile_ir(buf_ir, 1, TILE_COLS);
-        Tile2D tile_s2(buf_s2, 1, TILE_COLS);
-        Tile2D tile_s6(buf_s6, 1, TILE_COLS);
-        Tile2D tile_s12(buf_s12, 1, TILE_COLS);
-        Tile2D tile_fr(buf_fr, 1, TILE_COLS);
-        Tile2D tile_tmp(buf_tmp, 1, TILE_COLS);
-        Tile2D tile_ones(buf_ones, 1, TILE_COLS);
-        Tile2D tile_fx(buf_fx, 1, TILE_COLS);
-        Tile2D tile_fy(buf_fy, 1, TILE_COLS);
-        Tile2D tile_fz(buf_fz, 1, TILE_COLS);
+        /* ===== PTO Tile 分配 (栈上, 编译时固定大小, 模拟 NPU UB) ===== */
+        using T = TileFixed<1, TILE_COLS>;
+        T tile_xj, tile_yj, tile_zj;
+        T tile_dx, tile_dy, tile_dz;
+        T tile_xi, tile_yi, tile_zi;
+        T tile_rsq, tile_ir;
+        T tile_s2, tile_s6, tile_s12;
+        T tile_fr, tile_tmp, tile_ones;
+        T tile_fx, tile_fy, tile_fz;
 
         #pragma omp for schedule(dynamic, 64)
         for (int i = 0; i < n; i++) {
@@ -190,29 +170,7 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
                     int tile_n = (rem < TILE_COLS) ? rem : TILE_COLS;
                     int j0 = j_start + r;
 
-                    /* 更新有效列数 (PTO valid mask) */
-                    tile_xj.SetValidShape(1, tile_n);
-                    tile_yj.SetValidShape(1, tile_n);
-                    tile_zj.SetValidShape(1, tile_n);
-                    tile_dx.SetValidShape(1, tile_n);
-                    tile_dy.SetValidShape(1, tile_n);
-                    tile_dz.SetValidShape(1, tile_n);
-                    tile_xi.SetValidShape(1, tile_n);
-                    tile_yi.SetValidShape(1, tile_n);
-                    tile_zi.SetValidShape(1, tile_n);
-                    tile_rsq.SetValidShape(1, tile_n);
-                    tile_ir.SetValidShape(1, tile_n);
-                    tile_s2.SetValidShape(1, tile_n);
-                    tile_s6.SetValidShape(1, tile_n);
-                    tile_s12.SetValidShape(1, tile_n);
-                    tile_fr.SetValidShape(1, tile_n);
-                    tile_tmp.SetValidShape(1, tile_n);
-                    tile_ones.SetValidShape(1, tile_n);
-                    tile_fx.SetValidShape(1, tile_n);
-                    tile_fy.SetValidShape(1, tile_n);
-                    tile_fz.SetValidShape(1, tile_n);
-
-                    /* ===== PTO 算子流水线 ===== */
+                    /* ===== PTO 算子流水线 (编译时固定 TILE_COLS=8) ===== */
 
                     /* TLOAD: Global → Tile (连续j坐标) */
                     TLOAD(tile_xj, GlobalTensor1D(&sx[j0], 1));
@@ -224,7 +182,7 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
                     TFILL(tile_yi, yi);
                     TFILL(tile_zi, zi);
 
-                    /* TSUB: dx = xi - xj, dy = yi - yj, dz = zi - zj */
+                    /* TSUB: dx = xi - xj */
                     TSUB(tile_dx, tile_xi, tile_xj);
                     TSUB(tile_dy, tile_yi, tile_yj);
                     TSUB(tile_dz, tile_zi, tile_zj);
@@ -235,11 +193,11 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
                     TPBC(tile_dz, box[2], inv_bz);
 
                     /* TMUL + TADD: rsq = dx²+dy²+dz² */
-                    TMUL(tile_tmp, tile_dx, tile_dx);   /* tmp = dx² */
-                    TMUL(tile_rsq, tile_dy, tile_dy);   /* rsq = dy² */
-                    TADD(tile_rsq, tile_rsq, tile_tmp); /* rsq = dx²+dy² */
-                    TMUL(tile_tmp, tile_dz, tile_dz);    /* tmp = dz² */
-                    TADD(tile_rsq, tile_rsq, tile_tmp); /* rsq = dx²+dy²+dz² */
+                    TMUL(tile_tmp, tile_dx, tile_dx);
+                    TMUL(tile_rsq, tile_dy, tile_dy);
+                    TADD(tile_rsq, tile_rsq, tile_tmp);
+                    TMUL(tile_tmp, tile_dz, tile_dz);
+                    TADD(tile_rsq, tile_rsq, tile_tmp);
 
                     /* ★ TLJ_FORCE: LJ力融合算子 ★ */
                     TLJ_FORCE(tile_fx, tile_fy, tile_fz,
@@ -247,20 +205,19 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
                               lj_params,
                               tile_ir, tile_s2, tile_s6, tile_s12,
                               tile_fr, tile_tmp, tile_ones);
-
                     /* TROWTSUM: i力累加 — 只累加有效元素 */
                     for (int m = 0; m < tile_n; m++) {
-                        fix += buf_fx[m];
-                        fiy += buf_fy[m];
-                        fiz += buf_fz[m];
+                        fix += tile_fx.data[m];
+                        fiy += tile_fy.data[m];
+                        fiz += tile_fz.data[m];
                     }
 
                     /* TSCATTER: j力写回 */
                     for (int m = 0; m < tile_n; m++) {
                         int j = j0 + m;
-                        lfx[j] -= buf_fx[m];
-                        lfy[j] -= buf_fy[m];
-                        lfz[j] -= buf_fz[m];
+                        lfx[j] -= tile_fx.data[m];
+                        lfy[j] -= tile_fy.data[m];
+                        lfz[j] -= tile_fz.data[m];
                     }
                 }
                 k += run_len;
