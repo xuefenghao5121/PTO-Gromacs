@@ -149,9 +149,6 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
         p.box[0] = box[0]; p.box[1] = box[1]; p.box[2] = box[2];
         p.inv_box[0] = inv_bx; p.inv_box[1] = inv_by; p.inv_box[2] = inv_bz;
 
-        /* 临时数组 (线程私有, 一次分配) */
-        alignas(64) float fxo[8], fyo[8], fzo[8];
-
         #pragma omp for schedule(dynamic, 64)
         for (int i = 0; i < n; i++) {
             p.xi = sx[i]; p.yi = sy[i]; p.zi = sz[i];
@@ -172,14 +169,9 @@ static double ptoisa_nb_compute(float *sx, float *sy, float *sz,
                     int tile_n = (rem < TILE_COLS) ? rem : TILE_COLS;
                     int j0 = j_start + r;
 
-                    /* ★ TNONBONDED_LJ: 超级融合算子 ★
-                     * 整条计算链在 SVE 寄存器中完成:
-                     * load(xj) → sub(dx) → pbc → rsq → lj → adda(fi) → st(fj)
-                     * 中间不写回内存, 零 spill
-                     */
+                    /* ★ TNONBONDED_LJ: 超级融合算子 (向量化j力写回) ★ */
                     TNONBONDED_LJ(sx, sy, sz, j0, tile_n, p,
-                                  fix, fiy, fiz, lfx, lfy, lfz,
-                                  fxo, fyo, fzo);
+                                  fix, fiy, fiz, lfx, lfy, lfz);
                 }
                 k += run_len;
             }

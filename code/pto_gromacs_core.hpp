@@ -238,8 +238,7 @@ inline __attribute__((always_inline)) void TNONBONDED_LJ(
     int j0, int tile_n,                                  /* j 原子范围 */
     const NonBondedParams &p,                            /* 参数 */
     float &fix, float &fiy, float &fiz,                  /* i 力累加 */
-    float *lfx, float *lfy, float *lfz,                  /* j 力数组 */
-    float *fxo, float *fyo, float *fzo) {                /* 临时数组 */
+    float *lfx, float *lfy, float *lfz) {                /* j 力数组 */
 
     svbool_t pg_all = svptrue_b32();
     svbool_t pg = (tile_n < 8) ? svwhilelt_b32(0, tile_n) : pg_all;
@@ -303,15 +302,14 @@ inline __attribute__((always_inline)) void TNONBONDED_LJ(
     fiy += svadda_f32(valid, 0.0f, fy);
     fiz += svadda_f32(valid, 0.0f, fz);
 
-    /* Step 13: j 力写回 (用外部临时数组) */
-    svst1_f32(pg, fxo, fx);
-    svst1_f32(pg, fyo, fy);
-    svst1_f32(pg, fzo, fz);
-    for (int m = 0; m < tile_n; m++) {
-        int j = j0 + m;
-        lfx[j] -= fxo[m];
-        lfy[j] -= fyo[m];
-        lfz[j] -= fzo[m];
+    /* Step 13: j 力写回 (向量化 read-modify-write) */
+    if (svptest_any(pg_all, valid)) {
+        svfloat32_t old_lfx = svld1_f32(pg, &lfx[j0]);
+        svfloat32_t old_lfy = svld1_f32(pg, &lfy[j0]);
+        svfloat32_t old_lfz = svld1_f32(pg, &lfz[j0]);
+        svst1_f32(pg, &lfx[j0], svsub_f32_x(pg, old_lfx, fx));
+        svst1_f32(pg, &lfy[j0], svsub_f32_x(pg, old_lfy, fy));
+        svst1_f32(pg, &lfz[j0], svsub_f32_x(pg, old_lfz, fz));
     }
 }
 
