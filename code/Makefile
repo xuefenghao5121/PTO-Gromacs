@@ -13,18 +13,17 @@ CC ?= gcc
 
 # ===== 鲲鹏930 SVE 优化配置 =====
 CFLAGS  = -O3
-CFLAGS += -march=armv9-a+sve+sve2
-CFLAGS += -mcpu=tsv110
+CFLAGS += -march=armv8.6-a+sve
 CFLAGS += -msve-vector-bits=256
 CFLAGS += -ffast-math -funroll-loops -fipa-pta
 CFLAGS += -falign-functions=64 -falign-loops=16
 CFLAGS += -flto=auto
 CFLAGS += -fopenmp -fopenmp-simd
 CFLAGS += -Wall -Wextra -I.
-CFLAGS += -DARM64=1 -DHAVE_SVE=1 -DHAVE_SVE2=1 -DSVE_VECTOR_BITS=256
+CFLAGS += -DARM64=1 -DHAVE_SVE=1 -DSVE_VECTOR_BITS=256
 CFLAGS += -DTILE_SIZE_DEFAULT=512 -DTILE_SIZE_MAX=1024
 
-LDFLAGS = -lm -lnuma -fopenmp
+LDFLAGS = -lm -fopenmp
 
 # SVE 核心源文件
 SOURCES = gromacs_pto_tiling.c gromacs_pto_sve.c

@@ -103,6 +103,15 @@ typedef struct {
     int  *sorted_jatoms;   /* sorted j indices */
 } PTOv3Ctx;
 
+static void ptov3_repack_coords(PTOv3Ctx *ctx, const float *aos_coords) {
+    int n = ctx->n;
+    for (int i = 0; i < n; i++) {
+        ctx->sx[i] = aos_coords[i * 3 + 0];
+        ctx->sy[i] = aos_coords[i * 3 + 1];
+        ctx->sz[i] = aos_coords[i * 3 + 2];
+    }
+}
+
 static PTOv3Ctx* ptov3_init(const float *aos_coords, int n, const NBList *nl,
                              int tile_size) {
     PTOv3Ctx *ctx = calloc(1, sizeof(PTOv3Ctx));
@@ -175,15 +184,6 @@ static PTOv3Ctx* ptov3_init(const float *aos_coords, int n, const NBList *nl,
     ptov3_repack_coords(ctx, aos_coords);
     
     return ctx;
-}
-
-static void ptov3_repack_coords(PTOv3Ctx *ctx, const float *aos_coords) {
-    int n = ctx->n;
-    for (int i = 0; i < n; i++) {
-        ctx->sx[i] = aos_coords[i * 3 + 0];
-        ctx->sy[i] = aos_coords[i * 3 + 1];
-        ctx->sz[i] = aos_coords[i * 3 + 2];
-    }
 }
 
 static void ptov3_destroy(PTOv3Ctx *ctx) {
@@ -380,7 +380,7 @@ int main(int argc, char *argv[]) {
     printf("================================================================\n");
     printf("Atoms: %d | Box: %.1fx%.1fx%.1f | Cut: %.2f | Steps: %d | Tile: %d\n",
            n, g->box[0],g->box[1],g->box[2], cut, steps, tile_size);
-    printf("SVE: %d-bit (%d floats)\n", svcntb()*8, svcntw());
+    printf("SVE: %ld-bit (%ld floats)\n", svcntb()*8, svcntw());
     printf("Threads: %d\n\n", omp_get_max_threads());
     
     /* Build neighbor list */
