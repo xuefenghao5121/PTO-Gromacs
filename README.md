@@ -5,22 +5,43 @@
 | 版本 | Small T16 | Medium T32 | Large T32 | 说明 |
 |------|-----------|------------|-----------|------|
 | v5 (手写SVE) | 11.35x | **19.78x** | **13.09x** | Medium/Large 最优 |
-| v8 (PTO-ISA) | **12.74x** | 16.43x | 10.67x | Small 最优，可移植 |
+| v8 (mega-kernel) | **12.74x** | 16.43x | 10.67x | Small 最优 |
+| v11 (PTO-ISA chain) | 27.44x | 44.83x | - | 真正的 PTO-ISA 算子组合 |
 
 **Small 规模 v8 超过 v5 12%！**
 
 ## 关键发现
 
-1. **`svptest_any`** - Medium/Large 规模节省 50% 时间（跳过无效原子）
-2. **标量循环写回** - GCC 自动向量化比显式 SVE 更高效
-3. **最优方案** - Small 用 v8，Medium/Large 用 v5
+### 1. Mega-kernel vs PTO-ISA 算子链
+
+| 方案 | Small T16 | 性能差距 | 原因 |
+|------|-----------|----------|------|
+| v8 (mega-kernel) | **12.70x** | 最优 | 全程在 SVE 寄存器，零中间写回 |
+| v11 (PTO-ISA chain) | 27.44x | 慢 91% | 每个算子都有 load/store 开销 |
+
+**结论**：PTO-ISA 算子组合的性能不如 mega-kernel，因为中间结果需要写回 Tile 内存。
+
+### 2. `svptest_any` 优化效果
+
+| 版本 | Medium T32 | 说明 |
+|------|------------|------|
+| v5 (svptest_any) | **19.53x** | 最优 |
+| v5_noptest (无 svptest_any) | 37.28x | 慢 91% |
+
+**结论**：`svptest_any` 在 Medium/Large 规模是有效优化。
+
+### 3. 最优方案
+
+- **Small 规模**：v8（mega-kernel，零中间写回）
+- **Medium/Large 规模**：v5（svptest_any + 标量循环写回）
 
 ## 目录结构
 
 ```
 code/
 ├── pto_e2e_v5.c              # 手写 SVE（Medium/Large 最优）
-├── pto_e2e_v8_megakernel.cpp # PTO-ISA（Small 最优）
+├── pto_e2e_v8_megakernel.cpp # Mega-kernel（Small 最优）
+├── pto_e2e_v11_ptoisa_chain.cpp # PTO-ISA 算子链（可移植，性能较差）
 └── pto_gromacs_core.hpp      # PTO-ISA 核心接口
 ```
 

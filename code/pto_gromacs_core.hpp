@@ -103,16 +103,16 @@ struct LJParamsT {
 
 /* --- TLOAD: svld1_f32 --- */
 template<int R, int C>
-inline __attribute__((always_inline)) void TLOAD(TileFixed<R,C> &dst, const GlobalTensor1D &src) {
+inline __attribute__((always_inline)) void TLOAD(TileFixed<R,C> &dst, const GlobalTensor1D &src, int offset = 0) {
     svbool_t pg = svptrue_b32();
     if (src.stride == 1) {
         /* 连续加载: 等价于 svld1 */
-        svfloat32_t v = svld1_f32(pg, src.data);
+        svfloat32_t v = svld1_f32(pg, src.data + offset);
         svst1_f32(pg, dst.data, v);
     } else {
         /* 带步幅: gather */
         svint32_t idx = svindex_s32(0, src.stride);
-        svfloat32_t v = svld1_gather_s32index_f32(pg, src.data, idx);
+        svfloat32_t v = svld1_gather_s32index_f32(pg, src.data + offset * src.stride, idx);
         svst1_f32(pg, dst.data, v);
     }
 }
@@ -122,6 +122,14 @@ template<int R, int C>
 inline __attribute__((always_inline)) void TFILL(TileFixed<R,C> &dst, float value) {
     svfloat32_t v = svdup_f32(value);
     svst1_f32(svptrue_b32(), dst.data, v);
+}
+
+/* --- TREDUCE: svadda_f32 横向归约 --- */
+template<int R, int C>
+inline __attribute__((always_inline)) float TREDUCE(const TileFixed<R,C> &src) {
+    svbool_t pg = svptrue_b32();
+    svfloat32_t v = svld1_f32(pg, src.data);
+    return svadda_f32(pg, 0.0f, v);
 }
 
 /* --- TMUL: svmul_f32_x --- */
@@ -385,13 +393,13 @@ inline __attribute__((always_inline)) void TLJ_FORCE(
 
 /* --- TLOAD --- */
 template<int R, int C>
-inline __attribute__((always_inline)) void TLOAD(TileFixed<R,C> &dst, const GlobalTensor1D &src) {
+inline __attribute__((always_inline)) void TLOAD(TileFixed<R,C> &dst, const GlobalTensor1D &src, int offset = 0) {
     if (src.stride == 1) {
         PTO_CPU_VECTORIZE_LOOP
-        for (int i = 0; i < C; i++) dst.data[i] = src.data[i];
+        for (int i = 0; i < C; i++) dst.data[i] = src.data[offset + i];
     } else {
         PTO_CPU_VECTORIZE_LOOP
-        for (int i = 0; i < C; i++) dst.data[i] = src.data[i * src.stride];
+        for (int i = 0; i < C; i++) dst.data[i] = src.data[(offset + i) * src.stride];
     }
 }
 
@@ -400,6 +408,15 @@ template<int R, int C>
 inline __attribute__((always_inline)) void TFILL(TileFixed<R,C> &dst, float value) {
     PTO_CPU_VECTORIZE_LOOP
     for (int i = 0; i < C; i++) dst.data[i] = value;
+}
+
+/* --- TREDUCE --- */
+template<int R, int C>
+inline __attribute__((always_inline)) float TREDUCE(const TileFixed<R,C> &src) {
+    float sum = 0.0f;
+    PTO_CPU_VECTORIZE_LOOP
+    for (int i = 0; i < C; i++) sum += src.data[i];
+    return sum;
 }
 
 /* --- TMUL --- */
